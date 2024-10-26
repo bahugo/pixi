@@ -1,17 +1,28 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::Parser;
 use futures::TryStreamExt;
 use indicatif::HumanBytes;
-use miette::IntoDiagnostic;
+use miette::{Diagnostic, IntoDiagnostic};
+use reqwest::StatusCode;
 
 use rattler_digest::{compute_file_digest, Sha256};
+use rattler_networking::AuthenticationMiddleware;
+use thiserror::Error;
 use tokio::fs::File;
 use tokio_util::io::ReaderStream;
 
-use crate::{default_authenticated_client, progress};
+use pixi_progress;
 
-/// Upload a package to a prefix.dev channel
+#[allow(rustdoc::bare_urls)]
+/// Upload a conda package
+///
+/// With this command, you can upload a conda package to a channel.
+/// Example:
+///     pixi upload https://prefix.dev/api/v1/upload/my_channel my_package.conda
+///
+/// Use `pixi auth login` to authenticate with the server.
 #[derive(Parser, Debug)]
 pub struct Args {
     /// The host + channel to upload to
@@ -39,7 +50,9 @@ pub async fn execute(args: Args) -> miette::Result<()> {
         HumanBytes(filesize)
     );
 
-    let client = default_authenticated_client();
+    let client = reqwest_middleware::ClientBuilder::new(reqwest::Client::new())
+        .with_arc(Arc::new(AuthenticationMiddleware::default()))
+        .build();
 
     let sha256sum = format!(
         "{:x}",
@@ -50,7 +63,7 @@ pub async fn execute(args: Args) -> miette::Result<()> {
 
     let progress_bar = indicatif::ProgressBar::new(filesize)
         .with_prefix("Uploading")
-        .with_style(progress::default_bytes_style());
+        .with_style(pixi_progress::default_bytes_style());
 
     let reader_stream = ReaderStream::new(file)
         .inspect_ok(move |bytes| {
@@ -71,22 +84,92 @@ pub async fn execute(args: Args) -> miette::Result<()> {
         .body(body)
         .send()
         .await
-        .into_diagnostic()?;
+        .map_err(|e| UploadError::RequestFailed {
+            host: args.host.clone(),
+            source: e,
+        })?;
 
-    if response.status().is_success() {
-        println!("Upload successful!");
-    } else {
-        println!("Upload failed!");
-
-        if response.status() == 401 {
-            println!(
-                "Authentication failed! Did you run `pixi auth login {}`?",
-                args.host
+    match response.status() {
+        StatusCode::OK => {
+            eprintln!(
+                "{} Package uploaded successfully!",
+                console::style("✔").green()
             );
         }
-
-        std::process::exit(1);
+        StatusCode::UNAUTHORIZED => {
+            return Err(UploadError::Unauthorized {
+                host: args.host.clone(),
+                source: response.error_for_status().unwrap_err(), // Capture reqwest error
+            }
+            .into());
+        }
+        StatusCode::INTERNAL_SERVER_ERROR => {
+            return Err(UploadError::ServerError {
+                host: args.host.clone(),
+                source: response.error_for_status().unwrap_err(), // Capture reqwest error
+            }
+            .into());
+        }
+        StatusCode::CONFLICT => {
+            return Err(UploadError::Conflict {
+                host: args.host.clone(),
+                source: response.error_for_status().unwrap_err(), // Capture reqwest error
+            }
+            .into());
+        }
+        status => {
+            return Err(UploadError::UnexpectedStatus {
+                host: args.host.clone(),
+                status,
+                source: response.error_for_status().unwrap_err(), // Capture reqwest error
+            }
+            .into());
+        }
     }
 
     Ok(())
+}
+
+#[derive(Debug, Error, Diagnostic)]
+pub enum UploadError {
+    #[error("Failed to send request to {host}")]
+    #[diagnostic(help("Check if the host is correct and reachable."))]
+    RequestFailed {
+        host: String,
+        #[source]
+        source: reqwest_middleware::Error,
+    },
+
+    #[error("Unauthorized request to {host}")]
+    #[diagnostic(help("Try logging in with `pixi auth login`."))]
+    Unauthorized {
+        host: String,
+        #[source]
+        source: reqwest::Error,
+    },
+
+    #[error("Server error at {host}")]
+    #[diagnostic(help("The server encountered an internal error. Try again later."))]
+    ServerError {
+        host: String,
+        #[source]
+        source: reqwest::Error,
+    },
+
+    #[error("Unexpected response from {host}: {status}")]
+    #[diagnostic(help("Unexpected status code, verify the API specification."))]
+    UnexpectedStatus {
+        host: String,
+        status: StatusCode,
+        #[source]
+        source: reqwest::Error,
+    },
+
+    #[error("Conflict: The package likely already exists in the channel: {host}")]
+    #[diagnostic(help("Try changing the package version or build number."))]
+    Conflict {
+        host: String,
+        #[source]
+        source: reqwest::Error,
+    },
 }

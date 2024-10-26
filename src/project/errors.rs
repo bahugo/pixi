@@ -1,7 +1,8 @@
-use crate::project::manifest::EnvironmentName;
 use crate::Project;
+use fancy_display::FancyDisplay;
 use itertools::Itertools;
 use miette::{Diagnostic, LabeledSpan};
+use pixi_manifest::{EnvironmentName, TaskName};
 use rattler_conda_types::Platform;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
@@ -11,9 +12,9 @@ use thiserror::Error;
 /// TODO: Make this error better by also explaining to the user why a certain platform was not
 ///  supported and with suggestions as how to fix it.
 #[derive(Debug, Clone)]
-pub struct UnsupportedPlatformError<'p> {
-    /// The project that the platform is not supported for.
-    pub project: &'p Project,
+pub struct UnsupportedPlatformError {
+    /// Platforms supported by the environment
+    pub environments_platforms: Vec<Platform>,
 
     /// The environment that the platform is not supported for.
     pub environment: EnvironmentName,
@@ -22,9 +23,9 @@ pub struct UnsupportedPlatformError<'p> {
     pub platform: Platform,
 }
 
-impl<'p> Error for UnsupportedPlatformError<'p> {}
+impl Error for UnsupportedPlatformError {}
 
-impl<'p> Display for UnsupportedPlatformError<'p> {
+impl Display for UnsupportedPlatformError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match &self.environment {
             EnvironmentName::Default => {
@@ -39,16 +40,15 @@ impl<'p> Display for UnsupportedPlatformError<'p> {
     }
 }
 
-impl<'p> Diagnostic for UnsupportedPlatformError<'p> {
+impl Diagnostic for UnsupportedPlatformError {
     fn code(&self) -> Option<Box<dyn Display + '_>> {
         Some(Box::new("unsupported-platform".to_string()))
     }
 
     fn help(&self) -> Option<Box<dyn Display + '_>> {
-        let env = self.project.environment(&self.environment)?;
         Some(Box::new(format!(
             "supported platforms are {}",
-            env.platforms().into_iter().format(", ")
+            self.environments_platforms.iter().format(", ")
         )))
     }
 
@@ -62,7 +62,7 @@ impl<'p> Diagnostic for UnsupportedPlatformError<'p> {
 ///     - Include names that might have been meant instead
 ///     - If the tasks is only available for a certain platform, explain that.
 #[derive(Debug, Clone, Diagnostic, Error)]
-#[error("the task '{task_name}' could not be found")]
+#[error("the task '{0}' could not be found", task_name.fancy_display())]
 pub struct UnknownTask<'p> {
     /// The project that the platform is not supported for.
     pub project: &'p Project,
@@ -74,5 +74,5 @@ pub struct UnknownTask<'p> {
     pub platform: Option<Platform>,
 
     /// The name of the task
-    pub task_name: String,
+    pub task_name: TaskName,
 }

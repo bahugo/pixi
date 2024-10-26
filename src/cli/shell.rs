@@ -1,33 +1,51 @@
-use crate::{prompt, Project};
+use std::{collections::HashMap, io::Write};
+
 use clap::Parser;
 use miette::IntoDiagnostic;
 use rattler_conda_types::Platform;
-use rattler_shell::activation::PathModificationBehavior;
-use rattler_shell::shell::{PowerShell, Shell, ShellEnum, ShellScript};
-use std::collections::HashMap;
-use std::io::Write;
-use std::path::PathBuf;
+use rattler_shell::{
+    activation::PathModificationBehavior,
+    shell::{CmdExe, PowerShell, Shell, ShellEnum, ShellScript},
+};
 
+use crate::cli::cli_config::{PrefixUpdateConfig, ProjectConfig};
+use crate::{
+    activation::CurrentEnvVarBehavior, environment::update_prefix,
+    project::virtual_packages::verify_current_platform_has_required_virtual_packages, prompt,
+    Project,
+};
+use pixi_config::ConfigCliPrompt;
+use pixi_manifest::EnvironmentName;
 #[cfg(target_family = "unix")]
-use crate::unix::PtySession;
-
-use crate::cli::LockFileUsageArgs;
-use crate::environment::get_up_to_date_prefix;
-use crate::environment::LockFileUsage;
-#[cfg(target_family = "windows")]
-use rattler_shell::shell::CmdExe;
-
-use super::run::run_activation_async;
+use pixi_pty::unix::PtySession;
 
 /// Start a shell in the pixi environment of the project
 #[derive(Parser, Debug)]
 pub struct Args {
-    /// The path to 'pixi.toml'
-    #[arg(long)]
-    manifest_path: Option<PathBuf>,
+    #[clap(flatten)]
+    project_config: ProjectConfig,
 
     #[clap(flatten)]
-    lock_file_usage: LockFileUsageArgs,
+    pub prefix_update_config: PrefixUpdateConfig,
+
+    /// The environment to activate in the shell
+    #[arg(long, short)]
+    environment: Option<String>,
+
+    #[clap(flatten)]
+    prompt_config: ConfigCliPrompt,
+}
+
+/// Set up Ctrl-C handler to ignore it (the child process should react on CTRL-C)
+fn ignore_ctrl_c() {
+    tokio::spawn(async move {
+        loop {
+            tokio::signal::ctrl_c()
+                .await
+                .expect("Failed to listen for Ctrl+C");
+            // Do nothing, effectively ignoring the Ctrl+C signal
+        }
+    });
 }
 
 fn start_powershell(
@@ -43,10 +61,10 @@ fn start_powershell(
 
     let mut shell_script = ShellScript::new(pwsh.clone(), Platform::current());
     for (key, value) in env {
-        shell_script.set_env_var(key, value);
+        shell_script.set_env_var(key, value).into_diagnostic()?;
     }
     temp_file
-        .write_all(shell_script.contents.as_bytes())
+        .write_all(shell_script.contents().into_diagnostic()?.as_bytes())
         .into_diagnostic()?;
 
     // Write custom prompt to the env file
@@ -61,11 +79,14 @@ fn start_powershell(
     command.arg("-File");
     command.arg(&temp_path);
 
+    ignore_ctrl_c();
+
     let mut process = command.spawn().into_diagnostic()?;
     Ok(process.wait().into_diagnostic()?.code())
 }
 
-#[cfg(target_family = "windows")]
+// allowing dead code so that we test this on unix compilation as well
+#[allow(dead_code)]
 fn start_cmdexe(
     cmdexe: CmdExe,
     env: &HashMap<String, String>,
@@ -80,10 +101,10 @@ fn start_cmdexe(
     // TODO: Should we just execute the activation scripts directly for cmd.exe?
     let mut shell_script = ShellScript::new(cmdexe, Platform::current());
     for (key, value) in env {
-        shell_script.set_env_var(key, value);
+        shell_script.set_env_var(key, value).into_diagnostic()?;
     }
     temp_file
-        .write_all(shell_script.contents.as_bytes())
+        .write_all(shell_script.contents().into_diagnostic()?.as_bytes())
         .into_diagnostic()?;
 
     // Write custom prompt to the env file
@@ -92,6 +113,8 @@ fn start_cmdexe(
     let mut command = std::process::Command::new(cmdexe.executable());
     command.arg("/K");
     command.arg(temp_file.path());
+
+    ignore_ctrl_c();
 
     let mut process = command.spawn().into_diagnostic()?;
     Ok(process.wait().into_diagnostic()?.code())
@@ -103,7 +126,7 @@ fn start_cmdexe(
 /// - `args`: A vector of arguments to pass to the shell.
 /// - `env`: A HashMap containing environment variables to set in the shell.
 #[cfg(target_family = "unix")]
-async fn start_unix_shell<T: Shell + Copy>(
+async fn start_unix_shell<T: Shell + Copy + 'static>(
     shell: T,
     args: Vec<&str>,
     env: &HashMap<String, String>,
@@ -119,11 +142,14 @@ async fn start_unix_shell<T: Shell + Copy>(
 
     let mut shell_script = ShellScript::new(shell, Platform::current());
     for (key, value) in env {
-        shell_script.set_env_var(key, value);
+        shell_script.set_env_var(key, value).into_diagnostic()?;
     }
 
+    const DONE_STR: &str = "=== DONE ===";
+    shell_script.echo(DONE_STR).into_diagnostic()?;
+
     temp_file
-        .write_all(shell_script.contents.as_bytes())
+        .write_all(shell_script.contents().into_diagnostic()?.as_bytes())
         .into_diagnostic()?;
 
     // Write custom prompt to the env file
@@ -147,7 +173,7 @@ async fn start_unix_shell<T: Shell + Copy>(
     let mut process = PtySession::new(command).into_diagnostic()?;
     process.send_line(source_command).into_diagnostic()?;
 
-    process.interact().into_diagnostic()
+    process.interact(Some(DONE_STR)).into_diagnostic()
 }
 
 /// Starts a nu shell.
@@ -172,14 +198,16 @@ async fn start_nu_shell(
         if key == "PATH" {
             // split path with PATHSEP
             let paths = std::env::split_paths(value).collect::<Vec<_>>();
-            shell_script.set_path(&paths, PathModificationBehavior::Replace);
+            shell_script
+                .set_path(&paths, PathModificationBehavior::Replace)
+                .into_diagnostic()?;
         } else {
-            shell_script.set_env_var(key, value);
+            shell_script.set_env_var(key, value).into_diagnostic()?;
         }
     }
 
     temp_file
-        .write_all(shell_script.contents.as_bytes())
+        .write_all(shell_script.contents().into_diagnostic()?.as_bytes())
         .into_diagnostic()?;
 
     // Write custom prompt to the env file
@@ -193,40 +221,34 @@ async fn start_nu_shell(
     Ok(process.wait().into_diagnostic()?.code())
 }
 
-/// Determine the environment variables that need to be set in an interactive shell to make it
-/// function as if the environment has been activated. This method runs the activation scripts from
-/// the environment and stores the environment variables it added, finally it adds environment
-/// variables from the project.
-pub async fn get_shell_env(
-    project: &Project,
-    lock_file_usage: LockFileUsage,
-) -> miette::Result<HashMap<String, String>> {
-    // Get the prefix which we can then activate.
-    let prefix = get_up_to_date_prefix(project, lock_file_usage, false, None).await?;
-
-    // Get environment variables from the activation
-    let activation_env = run_activation_async(project, prefix).await?;
-
-    // Get environment variables from the manifest
-    let manifest_env = project.get_metadata_env();
-
-    // Add the conda default env variable so that the existing tools know about the env.
-    let mut shell_env = HashMap::new();
-    shell_env.insert("CONDA_DEFAULT_ENV".to_string(), project.name().to_string());
-
-    // Construct command environment by concatenating the environments
-    Ok(activation_env
-        .into_iter()
-        .chain(manifest_env.into_iter())
-        .chain(shell_env.into_iter())
-        .collect())
-}
-
 pub async fn execute(args: Args) -> miette::Result<()> {
-    let project = Project::load_or_else_discover(args.manifest_path.as_deref())?;
+    let config = args
+        .prompt_config
+        .merge_with_config(args.prefix_update_config.config.clone().into());
+    let project = Project::load_or_else_discover(args.project_config.manifest_path.as_deref())?
+        .with_cli_config(config);
+    let environment = project.environment_from_name_or_env_var(args.environment)?;
 
-    // Get the environment variables we need to set activate the project in the shell.
-    let env = get_shell_env(&project, args.lock_file_usage.into()).await?;
+    verify_current_platform_has_required_virtual_packages(&environment).into_diagnostic()?;
+
+    let prompt_name = match environment.name() {
+        EnvironmentName::Default => project.name().to_string(),
+        EnvironmentName::Named(name) => format!("{}:{}", project.name(), name),
+    };
+
+    // Make sure environment is up-to-date, default to install, users can avoid this with frozen or locked.
+    update_prefix(
+        &environment,
+        args.prefix_update_config.lock_file_usage(),
+        false,
+    )
+    .await?;
+
+    // Get the environment variables we need to set activate the environment in the shell.
+    let env = project
+        .get_activated_environment_variables(&environment, CurrentEnvVarBehavior::Exclude)
+        .await?;
+
     tracing::debug!("Pixi environment activation:\n{:?}", env);
 
     // Start the shell as the last part of the activation script based on the default shell.
@@ -234,17 +256,27 @@ pub async fn execute(args: Args) -> miette::Result<()> {
         .or_else(ShellEnum::from_env)
         .unwrap_or_default();
 
+    tracing::info!("Starting shell: {:?}", interactive_shell);
+
+    let prompt = if project.config().change_ps1() {
+        match interactive_shell {
+            ShellEnum::NuShell(_) => prompt::get_nu_prompt(prompt_name.as_str()),
+            ShellEnum::PowerShell(_) => prompt::get_powershell_prompt(prompt_name.as_str()),
+            ShellEnum::Bash(_) => prompt::get_bash_hook(prompt_name.as_str()),
+            ShellEnum::Zsh(_) => prompt::get_zsh_hook(prompt_name.as_str()),
+            ShellEnum::Fish(_) => prompt::get_fish_prompt(prompt_name.as_str()),
+            ShellEnum::Xonsh(_) => prompt::get_xonsh_prompt(),
+            ShellEnum::CmdExe(_) => prompt::get_cmd_prompt(prompt_name.as_str()),
+        }
+    } else {
+        "".to_string()
+    };
+
     #[cfg(target_family = "windows")]
     let res = match interactive_shell {
-        ShellEnum::NuShell(nushell) => {
-            start_nu_shell(nushell, &env, prompt::get_nu_prompt(project.name())).await
-        }
-        ShellEnum::PowerShell(pwsh) => {
-            start_powershell(pwsh, &env, prompt::get_powershell_prompt(project.name()))
-        }
-        ShellEnum::CmdExe(cmdexe) => {
-            start_cmdexe(cmdexe, &env, prompt::get_cmd_prompt(project.name()))
-        }
+        ShellEnum::NuShell(nushell) => start_nu_shell(nushell, env, prompt).await,
+        ShellEnum::PowerShell(pwsh) => start_powershell(pwsh, env, prompt),
+        ShellEnum::CmdExe(cmdexe) => start_cmdexe(cmdexe, env, prompt),
         _ => {
             miette::bail!("Unsupported shell: {:?}", interactive_shell);
         }
@@ -252,36 +284,12 @@ pub async fn execute(args: Args) -> miette::Result<()> {
 
     #[cfg(target_family = "unix")]
     let res = match interactive_shell {
-        ShellEnum::NuShell(nushell) => {
-            start_nu_shell(nushell, &env, prompt::get_nu_prompt(project.name())).await
-        }
-        ShellEnum::PowerShell(pwsh) => {
-            start_powershell(pwsh, &env, prompt::get_powershell_prompt(project.name()))
-        }
-        ShellEnum::Bash(bash) => {
-            start_unix_shell(
-                bash,
-                vec!["-l", "-i"],
-                &env,
-                prompt::get_bash_prompt(project.name()),
-            )
-            .await
-        }
-        ShellEnum::Zsh(zsh) => {
-            start_unix_shell(
-                zsh,
-                vec!["-l", "-i"],
-                &env,
-                prompt::get_zsh_prompt(project.name()),
-            )
-            .await
-        }
-        ShellEnum::Fish(fish) => {
-            start_unix_shell(fish, vec![], &env, prompt::get_fish_prompt(project.name())).await
-        }
-        ShellEnum::Xonsh(xonsh) => {
-            start_unix_shell(xonsh, vec![], &env, prompt::get_xonsh_prompt()).await
-        }
+        ShellEnum::NuShell(nushell) => start_nu_shell(nushell, env, prompt).await,
+        ShellEnum::PowerShell(pwsh) => start_powershell(pwsh, env, prompt),
+        ShellEnum::Bash(bash) => start_unix_shell(bash, vec!["-l", "-i"], env, prompt).await,
+        ShellEnum::Zsh(zsh) => start_unix_shell(zsh, vec!["-l", "-i"], env, prompt).await,
+        ShellEnum::Fish(fish) => start_unix_shell(fish, vec![], env, prompt).await,
+        ShellEnum::Xonsh(xonsh) => start_unix_shell(xonsh, vec![], env, prompt).await,
         _ => {
             miette::bail!("Unsupported shell: {:?}", interactive_shell)
         }

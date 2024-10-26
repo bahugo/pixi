@@ -1,127 +1,61 @@
-use std::collections::HashSet;
-use std::fmt::Display;
+use crate::global::list::{list_environment, list_global_environments, GlobalSortBy};
+use crate::global::{EnvironmentName, Project};
+use clap::Parser;
+use fancy_display::FancyDisplay;
+use pixi_config::{Config, ConfigCli};
 use std::str::FromStr;
 
-use clap::Parser;
-use itertools::Itertools;
-use miette::IntoDiagnostic;
-use rattler_conda_types::PackageName;
-
-use crate::cli::global::install::{
-    bin_env_dir, find_and_map_executable_scripts, find_designated_package, BinDir, BinEnvDir,
-    BinScriptMapping,
-};
-use crate::prefix::Prefix;
-
 /// Lists all packages previously installed into a globally accessible location via `pixi global install`.
+///
+/// All environments:
+/// - Yellow: the binaries that are exposed.
+/// - Green: the packages that are explicit dependencies of the environment.
+/// - Blue: the version of the installed package.
+/// - Cyan: the name of the environment.
+///
+/// Per environment:
+/// - Green: packages that are explicitly installed.
 #[derive(Parser, Debug)]
-pub struct Args {}
+#[clap(verbatim_doc_comment)]
+pub struct Args {
+    /// List only packages matching a regular expression.
+    /// Without regex syntax it acts like a `contains` filter.
+    #[arg()]
+    pub regex: Option<String>,
 
-#[derive(Debug)]
-struct InstalledPackageInfo {
-    name: PackageName,
-    binaries: Vec<String>,
+    #[clap(flatten)]
+    config: ConfigCli,
+
+    /// The name of the environment to list.
+    #[clap(short, long)]
+    environment: Option<String>,
+
+    /// Sorting strategy for the package table of an environment
+    #[arg(long, default_value = "name", value_enum, requires = "environment")]
+    sort_by: GlobalSortBy,
 }
 
-impl Display for InstalledPackageInfo {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let binaries = self
-            .binaries
-            .iter()
-            .map(|name| format!("[bin] {}", console::style(name).bold()))
-            .join("\n     -  ");
-        write!(
-            f,
-            "  -  [package] {}\n     -  {binaries}",
-            console::style(&self.name.as_source()).bold()
-        )
-    }
-}
+pub async fn execute(args: Args) -> miette::Result<()> {
+    let config = Config::with_cli_config(&args.config);
+    let project = Project::discover_or_create()
+        .await?
+        .with_cli_config(config.clone());
 
-fn print_no_packages_found_message() {
-    eprintln!(
-        "{} No globally installed binaries found",
-        console::style("!").yellow().bold()
-    )
-}
+    if let Some(environment) = args.environment {
+        let env_name = EnvironmentName::from_str(environment.as_str())?;
+        // Verify that the environment is in sync with the manifest and report to the user otherwise
+        if !project.environment_in_sync(&env_name).await? {
+            tracing::warn!("The environment {} is not in sync with the manifest, to sync run\n\tpixi global sync", env_name.fancy_display());
+        }
 
-pub async fn execute(_args: Args) -> miette::Result<()> {
-    let packages = list_global_packages().await?;
-
-    let mut package_info = vec![];
-
-    for package_name in packages {
-        let Ok(BinEnvDir(bin_env_prefix)) = BinEnvDir::from_existing(&package_name).await else {
-            print_no_packages_found_message();
-            return Ok(());
-        };
-        let prefix = Prefix::new(bin_env_prefix)?;
-
-        let Ok(bin_prefix) = BinDir::from_existing().await else {
-            print_no_packages_found_message();
-            return Ok(());
-        };
-
-        // Find the installed package in the environment
-        let prefix_package = find_designated_package(&prefix, &package_name).await?;
-
-        let binaries: Vec<_> =
-            find_and_map_executable_scripts(&prefix, &prefix_package, &bin_prefix)
-                .await?
-                .into_iter()
-                .map(
-                    |BinScriptMapping {
-                         global_binary_path: path,
-                         ..
-                     }| {
-                        path.strip_prefix(&bin_prefix.0)
-                            .expect("script paths were constructed by joining onto BinDir")
-                            .to_string_lossy()
-                            .to_string()
-                    },
-                )
-                // Collecting to a HashSet first is a workaround for issue #317 and can be removed
-                // once that is fixed.
-                .collect::<HashSet<_>>()
-                .into_iter()
-                .collect();
-
-        package_info.push(InstalledPackageInfo {
-            name: package_name,
-            binaries,
-        });
-    }
-
-    if package_info.is_empty() {
-        print_no_packages_found_message();
+        list_environment(&project, &env_name, args.sort_by, args.regex).await?;
     } else {
-        eprintln!(
-            "Globally installed binary packages:\n{}",
-            package_info
-                .into_iter()
-                .map(|pkg| pkg.to_string())
-                .join("\n")
-        );
+        // Verify that the environments are in sync with the manifest and report to the user otherwise
+        if !project.environments_in_sync().await? {
+            tracing::warn!("The environments are not in sync with the manifest, to sync run\n\tpixi global sync");
+        }
+        list_global_environments(&project, None, None, args.regex).await?;
     }
 
     Ok(())
-}
-
-pub(super) async fn list_global_packages() -> Result<Vec<PackageName>, miette::ErrReport> {
-    let mut packages = vec![];
-    let mut dir_contents = tokio::fs::read_dir(bin_env_dir()?)
-        .await
-        .into_diagnostic()?;
-
-    while let Some(entry) = dir_contents.next_entry().await.into_diagnostic()? {
-        if entry.file_type().await.into_diagnostic()?.is_dir() {
-            let Ok(name) = PackageName::from_str(entry.file_name().to_string_lossy().as_ref())
-            else {
-                continue;
-            };
-            packages.push(name);
-        }
-    }
-
-    Ok(packages)
 }

@@ -12,9 +12,7 @@ CHESSBOARD_Y = 9
 SQUARE_SIZE_MM = 22.5
 
 objp = np.zeros((CHESSBOARD_X * CHESSBOARD_Y, 3), np.float32)
-objp[:, :2] = np.mgrid[0:CHESSBOARD_Y, 0:CHESSBOARD_X].T.reshape(-1, 2) * (
-    SQUARE_SIZE_MM * 0.001
-)
+objp[:, :2] = np.mgrid[0:CHESSBOARD_Y, 0:CHESSBOARD_X].T.reshape(-1, 2) * (SQUARE_SIZE_MM * 0.001)
 
 # Arrays to store object points and image points
 objpoints = []
@@ -54,18 +52,16 @@ while True:
         break
     elif k % 256 == 32:
         # SPACE pressed
-        img_name = "opencv_frame_{}.png".format(img_counter)
+        img_name = f"opencv_frame_{img_counter}.png"
         cv2.imwrite(img_name, frame_clean)
-        print("{} written!".format(img_name))
+        print(f"{img_name} written!")
         img_counter += 1
 
         # Convert to grayscale
         gray = cv2.cvtColor(frame_clean, cv2.COLOR_BGR2GRAY)
 
         # Find the chess board corners
-        ret, corners = cv2.findChessboardCorners(
-            gray, (CHESSBOARD_Y, CHESSBOARD_X), None
-        )
+        ret, corners = cv2.findChessboardCorners(gray, (CHESSBOARD_Y, CHESSBOARD_X), None)
 
         # If found, add object points, image points (after refining them)
         if ret:
@@ -109,18 +105,14 @@ if len(objpoints) > 0:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
         # Find the chess board corners
-        ret, corners = cv2.findChessboardCorners(
-            gray, (CHESSBOARD_Y, CHESSBOARD_X), None
-        )
+        ret, corners = cv2.findChessboardCorners(gray, (CHESSBOARD_Y, CHESSBOARD_X), None)
 
         if ret:
             corners2 = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
             imgpoints.append(corners2)
 
             # Draw and display the corners
-            frame = cv2.drawChessboardCorners(
-                frame, (CHESSBOARD_Y, CHESSBOARD_X), corners2, ret
-            )
+            frame = cv2.drawChessboardCorners(frame, (CHESSBOARD_Y, CHESSBOARD_X), corners2, ret)
 
             # Estimate pose of pattern
             _, rvecs, tvecs, _ = cv2.solvePnPRansac(objp, corners2, mtx, dist)

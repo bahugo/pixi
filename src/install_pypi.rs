@@ -1,519 +1,1002 @@
-use crate::environment::PythonStatus;
-use crate::prefix::Prefix;
-use crate::progress;
-use crate::progress::ProgressBarMessageFormatter;
-use futures::{stream, Stream, StreamExt, TryFutureExt, TryStreamExt};
-use indexmap::IndexSet;
-use indicatif::ProgressBar;
+use std::{
+    borrow::Cow, collections::HashMap, fs, path::Path, str::FromStr, sync::Arc, time::Duration,
+};
+
+use distribution_filename::{DistExtension, ExtensionError, SourceDistExtension, WheelFilename};
+use distribution_types::{
+    BuiltDist, CachedDist, Dist, IndexLocations, IndexUrl, InstalledDist, Name, RegistryBuiltDist,
+    RegistryBuiltWheel, RegistrySourceDist, SourceDist, UrlString,
+};
+use install_wheel_rs::linker::LinkMode;
 use itertools::Itertools;
 use miette::{IntoDiagnostic, WrapErr};
-
-use rattler_conda_types::Platform;
-use rattler_lock::{CondaLock, LockedDependency};
-use rip::artifacts::wheel::{InstallPaths, UnpackWheelOptions};
-use rip::artifacts::Wheel;
-use rip::index::PackageDb;
-use rip::python_env::{find_distributions_in_venv, uninstall_distribution, Distribution, WheelTag};
-use rip::types::{
-    Artifact, ArtifactHashes, ArtifactInfo, ArtifactName, Extra, NormalizedPackageName,
-    WheelFilename,
+use pep440_rs::{Version, VersionSpecifiers};
+use pep508_rs::{VerbatimUrl, VerbatimUrlError};
+use pixi_consts::consts;
+use pixi_manifest::{pyproject::PyProjectManifest, SystemRequirements};
+use pixi_uv_conversions::{isolated_names_to_packages, locked_indexes_to_index_locations};
+use pypi_modifiers::pypi_tags::{get_pypi_tags, is_python_record};
+use pypi_types::{
+    HashAlgorithm, HashDigest, ParsedGitUrl, ParsedUrl, ParsedUrlError, VerbatimParsedUrl,
 };
-use std::collections::HashSet;
-use std::path::Path;
-use std::str::FromStr;
-use std::time::Duration;
-use tokio::task::JoinError;
+use rattler_conda_types::{Platform, RepoDataRecord};
+use rattler_lock::{
+    PackageHashes, PypiIndexes, PypiPackageData, PypiPackageEnvironmentData, UrlOrPath,
+};
+use url::Url;
+use uv_auth::store_credentials_from_url;
+use uv_cache::{ArchiveTarget, ArchiveTimestamp, Cache};
+use uv_client::{Connectivity, FlatIndexClient, RegistryClientBuilder};
+use uv_configuration::{ConfigSettings, IndexStrategy};
+use uv_dispatch::BuildDispatch;
+use uv_distribution::{DistributionDatabase, RegistryWheelIndex};
+use uv_git::GitResolver;
+use uv_installer::{Preparer, SitePackages, UninstallError};
+use uv_normalize::PackageName;
+use uv_python::{Interpreter, PythonEnvironment};
+use uv_resolver::{FlatIndex, InMemoryIndex};
+use uv_types::HashStrategy;
 
-/// The installer name for pypi packages installed by pixi.
-pub(crate) const PIXI_PYPI_INSTALLER: &str = env!("CARGO_PKG_NAME");
+use pixi_uv_conversions::names_to_build_isolation;
 
-/// Installs and/or remove python distributions.
-pub async fn update_python_distributions(
-    package_db: &PackageDb,
-    prefix: &Prefix,
-    lock_file: &CondaLock,
-    platform: Platform,
-    status: &PythonStatus,
-) -> miette::Result<()> {
-    let python_info = match status {
-        PythonStatus::Changed { new, .. }
-        | PythonStatus::Unchanged(new)
-        | PythonStatus::Added { new } => new,
-        PythonStatus::Removed { .. } | PythonStatus::DoesNotExist => {
-            // No python interpreter in the environment, so there is nothing to do here.
-            return Ok(());
-        }
-    };
+use crate::{
+    conda_pypi_clobber::PypiCondaClobberRegistry,
+    lock_file::UvResolutionContext,
+    prefix::Prefix,
+    uv_reporter::{UvReporter, UvReporterOptions},
+};
 
-    // Determine where packages would have been installed
-    let python_version = (
-        python_info.short_version.0 as u32,
-        python_info.short_version.1 as u32,
-        0,
-    );
-    let install_paths = InstallPaths::for_venv(python_version, platform.is_windows());
+type CombinedPypiPackageData = (PypiPackageData, PypiPackageEnvironmentData);
 
-    // Determine the current python distributions in those locations
-    let current_python_packages = find_distributions_in_venv(prefix.root(), &install_paths)
-        .into_diagnostic()
-        .context(
-            "failed to locate python packages that have not been installed as conda packages",
-        )?;
+fn elapsed(duration: Duration) -> String {
+    let secs = duration.as_secs();
 
-    // Determine the python packages that are part of the lock-file
-    let python_packages = lock_file
-        .get_packages_by_platform(platform)
-        .filter(|p| p.is_pypi())
-        .collect_vec();
-
-    // Determine the python packages to remove before we start installing anything new. If the
-    // python version changed between installations we will have to remove any previous distribution
-    // regardless.
-    let (python_distributions_to_remove, python_distributions_to_install) =
-        determine_python_distributions_to_remove_and_install(
-            prefix.root(),
-            current_python_packages,
-            python_packages,
-        );
-
-    // Start downloading the python packages that we want in the background.
-    let (package_stream, package_stream_pb) =
-        stream_python_artifacts(package_db, python_distributions_to_install.clone());
-
-    // Remove python packages that need to be removed
-    if !python_distributions_to_remove.is_empty() {
-        let site_package_path = install_paths.site_packages();
-
-        for python_distribution in python_distributions_to_remove {
-            uninstall_pixi_installed_distribution(prefix, site_package_path, &python_distribution)?;
-        }
+    if secs >= 60 {
+        format!("{}m {:02}s", secs / 60, secs % 60)
+    } else if secs > 0 {
+        format!("{}.{:02}s", secs, duration.subsec_nanos() / 10_000_000)
+    } else {
+        format!("{}ms", duration.subsec_millis())
     }
-
-    // Install the individual python packages that we want
-    let package_install_pb = install_python_distributions(
-        prefix,
-        install_paths,
-        &prefix.root().join(python_info.path()),
-        package_stream,
-    )
-    .await?;
-
-    // Clear any pending progress bar
-    for pb in package_install_pb
-        .into_iter()
-        .chain(package_stream_pb.into_iter())
-    {
-        pb.finish_and_clear();
-    }
-
-    Ok(())
 }
 
-/// Concurrently installs python wheels as they become available.
-async fn install_python_distributions(
-    prefix: &Prefix,
-    install_paths: InstallPaths,
-    python_executable_path: &Path,
-    package_stream: impl Stream<Item = miette::Result<(Option<String>, HashSet<Extra>, Wheel)>> + Sized,
-) -> miette::Result<Option<ProgressBar>> {
-    // Determine the number of packages that we are going to install
-    let len = {
-        let (lower_bound, upper_bound) = package_stream.size_hint();
-        upper_bound.unwrap_or(lower_bound)
+/// Derived from uv [`uv_installer::Plan`]
+#[derive(Debug)]
+struct PixiInstallPlan {
+    /// The distributions that are not already installed in the current
+    /// environment, but are available in the local cache.
+    pub local: Vec<CachedDist>,
+
+    /// The distributions that are not already installed in the current
+    /// environment, and are not available in the local cache.
+    /// this is where we differ from UV because we want already have the URL we
+    /// want to download
+    pub remote: Vec<Dist>,
+
+    /// Any distributions that are already installed in the current environment,
+    /// but will be re-installed (including upgraded) to satisfy the
+    /// requirements.
+    pub reinstalls: Vec<InstalledDist>,
+
+    /// Any distributions that are already installed in the current environment,
+    /// and are _not_ necessary to satisfy the requirements.
+    pub extraneous: Vec<InstalledDist>,
+
+    /// Keep track of any packages that have been re-installed because of
+    /// installer mismatch we can warn the user later that this has happened
+    pub installer_mismatch: Vec<String>,
+}
+
+/// Converts our locked data to a file
+fn locked_data_to_file(
+    url: &Url,
+    hash: Option<&PackageHashes>,
+    filename: &str,
+    requires_python: Option<VersionSpecifiers>,
+) -> distribution_types::File {
+    let url = distribution_types::FileLocation::AbsoluteUrl(UrlString::from(url.clone()));
+
+    // Convert PackageHashes to uv hashes
+    let hashes = if let Some(hash) = hash {
+        match hash {
+            rattler_lock::PackageHashes::Md5(md5) => vec![HashDigest {
+                algorithm: HashAlgorithm::Md5,
+                digest: format!("{:x}", md5).into(),
+            }],
+            rattler_lock::PackageHashes::Sha256(sha256) => vec![HashDigest {
+                algorithm: HashAlgorithm::Sha256,
+                digest: format!("{:x}", sha256).into(),
+            }],
+            rattler_lock::PackageHashes::Md5Sha256(md5, sha256) => vec![
+                HashDigest {
+                    algorithm: HashAlgorithm::Md5,
+                    digest: format!("{:x}", md5).into(),
+                },
+                HashDigest {
+                    algorithm: HashAlgorithm::Sha256,
+                    digest: format!("{:x}", sha256).into(),
+                },
+            ],
+        }
+    } else {
+        vec![]
     };
-    if len == 0 {
-        return Ok(None);
+
+    distribution_types::File {
+        filename: filename.to_string(),
+        dist_info_metadata: false,
+        hashes,
+        requires_python,
+        upload_time_utc_ms: None,
+        yanked: None,
+        size: None,
+        url,
     }
+}
 
-    // Create a progress bar to show the progress of the installation
-    let pb = progress::global_multi_progress().add(ProgressBar::new(len as u64));
-    pb.set_style(progress::default_progress_style());
-    pb.set_prefix("unpacking wheels");
-    pb.enable_steady_tick(Duration::from_millis(100));
+/// Check if the url is a direct url
+/// Files, git, are direct urls
+/// Direct urls to wheels or sdists are prefixed with a `direct` scheme
+/// by us when resolving the lock file
+fn is_direct_url(url_scheme: &str) -> bool {
+    url_scheme == "file"
+        || url_scheme == "git+http"
+        || url_scheme == "git+https"
+        || url_scheme == "git+ssh"
+        || url_scheme.starts_with("direct")
+}
 
-    // Create a message formatter to show the current operation
-    let message_formatter = ProgressBarMessageFormatter::new(pb.clone());
+/// Strip of the `direct` scheme from the url if it is there
+fn strip_direct_scheme(url: &Url) -> Cow<'_, Url> {
+    url.as_ref()
+        .strip_prefix("direct+")
+        .and_then(|str| Url::from_str(str).ok())
+        .map(Cow::Owned)
+        .unwrap_or(Cow::Borrowed(url))
+}
 
-    // Concurrently unpack the wheels as they become available in the stream.
-    let install_pb = pb.clone();
-    package_stream
-        .try_for_each_concurrent(Some(20), move |(hash, extras, wheel)| {
-            let install_paths = install_paths.clone();
-            let root = prefix.root().to_path_buf();
-            let message_formatter = message_formatter.clone();
-            let pb = install_pb.clone();
-            let python_executable_path = python_executable_path.to_owned();
-            async move {
-                let pb_task = message_formatter.start(wheel.name().to_string()).await;
-                let unpack_result = tokio::task::spawn_blocking(move || {
-                    wheel
-                        .unpack(
-                            &root,
-                            &install_paths,
-                            &python_executable_path,
-                            &UnpackWheelOptions {
-                                installer: Some(PIXI_PYPI_INSTALLER.into()),
-                                extras: Some(extras),
-                                ..Default::default()
-                            },
-                        )
-                        .into_diagnostic()
-                        .and_then(|unpacked_wheel| {
-                            if let Some(hash) = hash {
-                                std::fs::write(unpacked_wheel.dist_info.join("HASH"), hash)
-                                    .into_diagnostic()
-                            } else {
-                                Ok(())
-                            }
-                        })
-                })
-                .map_err(JoinError::try_into_panic)
-                .await;
+#[derive(Debug, thiserror::Error)]
+enum ConvertToUvDistError {
+    #[error("error creating ParsedUrl")]
+    ParseUrl(#[from] Box<ParsedUrlError>),
+    #[error("error creating uv Dist from url")]
+    Uv(#[from] distribution_types::Error),
+    #[error("error constructing verbatim url")]
+    VerbatimUrl(#[from] VerbatimUrlError),
+    #[error("error extracting extension from {1}")]
+    Extension(#[source] ExtensionError, String),
+}
 
-                pb_task.finish().await;
-                pb.inc(1);
+/// Convert from a PypiPackageData to a uv [`distribution_types::Dist`]
+fn convert_to_dist(
+    pkg: &PypiPackageData,
+    lock_file_dir: &Path,
+) -> Result<Dist, ConvertToUvDistError> {
+    // Figure out if it is a url from the registry or a direct url
+    let dist = match &pkg.url_or_path {
+        UrlOrPath::Url(url) if is_direct_url(url.scheme()) => {
+            let url_without_direct = strip_direct_scheme(url);
+            Dist::from_url(
+                pkg.name.clone(),
+                VerbatimParsedUrl {
+                    parsed_url: ParsedUrl::try_from(url_without_direct.clone().into_owned())
+                        .map_err(Box::new)?,
+                    verbatim: VerbatimUrl::from(url_without_direct.into_owned()),
+                },
+            )?
+        }
+        UrlOrPath::Url(url) => {
+            // We consider it to be a registry url
+            // Extract last component from registry url
+            // should be something like `package-0.1.0-py3-none-any.whl`
+            let filename_raw = url.path_segments().unwrap().last().unwrap();
 
-                match unpack_result {
-                    Ok(unpack_result) => unpack_result,
-                    Err(Ok(panic)) => std::panic::resume_unwind(panic),
-                    Err(Err(e)) => Err(miette::miette!("{e}")),
-                }
+            // Decode the filename to avoid issues with the HTTP coding like `%2B` to `+`
+            let filename_decoded =
+                percent_encoding::percent_decode_str(filename_raw).decode_utf8_lossy();
+
+            // Now we can convert the locked data to a [`distribution_types::File`]
+            // which is essentially the file information for a wheel or sdist
+            let file = locked_data_to_file(
+                url,
+                pkg.hash.as_ref(),
+                filename_decoded.as_ref(),
+                pkg.requires_python.clone(),
+            );
+
+            // Recreate the filename from the extracted last component
+            // If this errors this is not a valid wheel filename
+            // and we should consider it a sdist
+            let filename = WheelFilename::from_str(filename_decoded.as_ref());
+            if let Ok(filename) = filename {
+                Dist::Built(BuiltDist::Registry(RegistryBuiltDist {
+                    wheels: vec![RegistryBuiltWheel {
+                        filename,
+                        file: Box::new(file),
+                        // This should be fine because currently it is only used for caching
+                        // When upgrading uv and running into problems we would need to sort this
+                        // out but it would require adding the indexes to
+                        // the lock file
+                        index: IndexUrl::Pypi(VerbatimUrl::from_url(
+                            consts::DEFAULT_PYPI_INDEX_URL.clone(),
+                        )),
+                    }],
+                    best_wheel_index: 0,
+                    sdist: None,
+                }))
+            } else {
+                Dist::Source(SourceDist::Registry(RegistrySourceDist {
+                    name: pkg.name.clone(),
+                    version: pkg.version.clone(),
+                    file: Box::new(file),
+                    // This should be fine because currently it is only used for caching
+                    index: IndexUrl::Pypi(VerbatimUrl::from_url(
+                        consts::DEFAULT_PYPI_INDEX_URL.clone(),
+                    )),
+                    // I don't think this really matters for the install
+                    wheels: vec![],
+                    ext: SourceDistExtension::from_path(Path::new(filename_raw)).map_err(|e| {
+                        ConvertToUvDistError::Extension(e, filename_raw.to_string())
+                    })?,
+                }))
             }
-        })
-        .await?;
+        }
+        UrlOrPath::Path(path) => {
+            let abs_path = if path.is_absolute() {
+                path.clone()
+            } else {
+                lock_file_dir.join(path)
+            };
 
-    // Update the progress bar
-    pb.set_style(progress::finished_progress_style());
-    pb.finish();
-
-    Ok(Some(pb))
-}
-
-/// Creates a stream which downloads the specified python packages. The stream will download the
-/// packages in parallel and yield them as soon as they become available.
-fn stream_python_artifacts<'a>(
-    package_db: &'a PackageDb,
-    packages_to_download: Vec<&'a LockedDependency>,
-) -> (
-    impl Stream<Item = miette::Result<(Option<String>, HashSet<Extra>, Wheel)>> + 'a,
-    Option<ProgressBar>,
-) {
-    if packages_to_download.is_empty() {
-        return (stream::empty().left_stream(), None);
-    }
-
-    // Construct a progress bar to provide some indication on what is currently downloading.
-    // TODO: It would be much nicer if we can provide more information with regards to the progress.
-    //  For instance if we could also show at what speed the downloads are progressing or the total
-    //  size of the downloads that would really help the user I think.
-    let pb =
-        progress::global_multi_progress().add(ProgressBar::new(packages_to_download.len() as u64));
-    pb.set_style(progress::default_progress_style());
-    pb.set_prefix("acquiring wheels");
-    pb.enable_steady_tick(Duration::from_millis(100));
-
-    // Construct a message formatter
-    let message_formatter = ProgressBarMessageFormatter::new(pb.clone());
-
-    let stream_pb = pb.clone();
-    let total_packages = packages_to_download.len();
-    let download_stream = stream::iter(packages_to_download)
-        .map(move |package| {
-            let pb = stream_pb.clone();
-            let message_formatter = message_formatter.clone();
-            async move {
-                let pip_package = package
-                    .as_pypi()
-                    .expect("must be a pip package at this point");
-
-                // Determine the filename from the
-                let filename = pip_package
-                    .url
-                    .path_segments()
-                    .and_then(|s| s.last())
-                    .expect("url is missing a path");
-                let name = NormalizedPackageName::from_str(&package.name)
-                    .into_diagnostic()
-                    .with_context(|| {
-                        format!("'{}' is not a valid python package name", &package.name)
-                    })?;
-                let wheel_name = WheelFilename::from_filename(filename, &name)
-                    .expect("failed to convert filename to wheel filename");
-
-                // Log out intent to install this python package.
-                tracing::info!("downloading python package {filename}");
-                let pb_task = message_formatter.start(filename.to_string()).await;
-
-                // Reconstruct the ArtifactInfo from the data in the lockfile.
-                let artifact_info = ArtifactInfo {
-                    filename: ArtifactName::Wheel(wheel_name),
-                    url: pip_package.url.clone(),
-                    hashes: pip_package.hash.as_ref().map(|hash| ArtifactHashes {
-                        sha256: hash.sha256().cloned(),
-                    }),
-                    requires_python: pip_package
-                        .requires_python
-                        .as_ref()
-                        .map(|p| p.parse())
-                        .transpose()
-                        .expect("the lock file contains an invalid 'requires_python` field"),
-                    dist_info_metadata: Default::default(),
-                    yanked: Default::default(),
-                };
-
-                // TODO: Maybe we should have a cache of wheels separate from the package_db. Since a
-                //   wheel can just be identified by its hash or url.
-                let wheel: Wheel = package_db.get_wheel(&artifact_info, None).await?;
-
-                // Update the progress bar
-                pb_task.finish().await;
-                pb.inc(1);
-                if pb.position() == total_packages as u64 {
-                    pb.set_style(progress::finished_progress_style());
-                    pb.finish();
-                }
-
-                let hash = pip_package
-                    .hash
-                    .as_ref()
-                    .and_then(|h| h.sha256())
-                    .map(|sha256| format!("sha256-{:x}", sha256));
-
-                Ok((
-                    hash,
-                    pip_package
-                        .extras
-                        .iter()
-                        .filter_map(|e| Extra::from_str(e).ok())
-                        .collect(),
-                    wheel,
-                ))
+            let absolute_url = VerbatimUrl::from_absolute_path(&abs_path)?;
+            if abs_path.is_dir() {
+                Dist::from_directory_url(
+                    pkg.name.clone(),
+                    absolute_url,
+                    &abs_path,
+                    pkg.editable,
+                    false,
+                )?
+            } else {
+                Dist::from_file_url(
+                    pkg.name.clone(),
+                    absolute_url,
+                    &abs_path,
+                    DistExtension::from_path(&abs_path).map_err(|e| {
+                        ConvertToUvDistError::Extension(e, abs_path.to_string_lossy().to_string())
+                    })?,
+                )?
             }
-        })
-        .buffer_unordered(20)
-        .right_stream();
-
-    (download_stream, Some(pb))
-}
-
-/// If there was a previous version of python installed, remove any distribution installed in that
-/// environment.
-pub fn remove_old_python_distributions(
-    prefix: &Prefix,
-    platform: Platform,
-    python_changed: &PythonStatus,
-) -> miette::Result<()> {
-    // If the python version didn't change, there is nothing to do here.
-    let python_version = match python_changed {
-        PythonStatus::Removed { old } | PythonStatus::Changed { old, .. } => old,
-        PythonStatus::Added { .. } | PythonStatus::DoesNotExist | PythonStatus::Unchanged(_) => {
-            return Ok(())
         }
     };
 
-    // Get the interpreter version from the info
-    let python_version = (
-        python_version.short_version.0 as u32,
-        python_version.short_version.1 as u32,
-        0,
-    );
-    let install_paths = InstallPaths::for_venv(python_version, platform.is_windows());
-
-    // Locate the packages that are installed in the previous environment
-    let current_python_packages = find_distributions_in_venv(prefix.root(), &install_paths)
-        .into_diagnostic()
-        .with_context(|| format!("failed to determine the python packages installed for a previous version of python ({}.{})", python_version.0, python_version.1))?
-        .into_iter().filter(|d| d.installer.as_deref() != Some("conda") && d.installer.is_some()).collect_vec();
-
-    let pb = progress::global_multi_progress()
-        .add(ProgressBar::new(current_python_packages.len() as u64));
-    pb.set_style(progress::default_progress_style());
-    pb.set_message("removing old python packages");
-    pb.enable_steady_tick(Duration::from_millis(100));
-
-    // Remove the python packages
-    let site_package_path = install_paths.site_packages();
-    for python_package in current_python_packages {
-        pb.set_message(format!(
-            "{} {}",
-            &python_package.name, &python_package.version
-        ));
-
-        uninstall_pixi_installed_distribution(prefix, site_package_path, &python_package)?;
-
-        pb.inc(1);
-    }
-
-    Ok(())
+    Ok(dist)
 }
 
-/// Uninstalls a python distribution that was previously installed by pixi.
-fn uninstall_pixi_installed_distribution(
-    prefix: &Prefix,
-    site_package_path: &Path,
-    python_package: &Distribution,
-) -> miette::Result<()> {
-    tracing::info!(
-        "uninstalling python package {}-{}",
-        &python_package.name,
-        &python_package.version
-    );
-    let relative_dist_info = python_package
-        .dist_info
-        .strip_prefix(site_package_path)
-        .expect("the dist-info path must be a sub-path of the site-packages path");
-
-    // HACK: Also remove the HASH file that pixi writes. Ignore the error if its there. We
-    // should probably actually add this file to the RECORD.
-    let _ = std::fs::remove_file(prefix.root().join(&python_package.dist_info).join("HASH"));
-
-    uninstall_distribution(&prefix.root().join(site_package_path), relative_dist_info)
-        .into_diagnostic()
-        .with_context(|| format!("could not uninstall python package {}-{}. Manually remove the `.pixi/env` folder and try again.", &python_package.name, &python_package.version))?;
-
-    Ok(())
+enum ValidateInstall {
+    /// Keep this package
+    Keep,
+    /// Reinstall this package
+    Reinstall,
 }
 
-/// Determine which python packages we can leave untouched and which python packages should be
-/// removed.
-fn determine_python_distributions_to_remove_and_install<'p>(
-    prefix: &Path,
-    mut current_python_packages: Vec<Distribution>,
-    desired_python_packages: Vec<&'p LockedDependency>,
-) -> (Vec<Distribution>, Vec<&'p LockedDependency>) {
-    // Determine the artifact tags associated with the locked dependencies.
-    let mut desired_python_packages = extract_locked_tags(desired_python_packages);
-
-    // Any package that is currently installed that is not part of the locked dependencies should be
-    // removed. So we keep it in the `current_python_packages` list.
-    // Any package that is in the currently installed list that is NOT found in the lockfile is
-    // retained in the list to mark it for removal.
-    current_python_packages.retain(|current_python_packages| {
-        if current_python_packages.installer.is_none() {
-            // If this package has no installer, we can't make a reliable decision on whether to
-            // keep it or not. So we do not uninstall it.
-            return false;
-        }
-
-        if let Some(found_desired_packages_idx) =
-            desired_python_packages
-                .iter()
-                .position(|(pkg, artifact_name)| {
-                    does_installed_match_locked_package(
-                        prefix,
-                        current_python_packages,
-                        (pkg, artifact_name.as_ref()),
-                    )
-                })
+/// Check freshness of a locked url against an installed dist
+fn check_url_freshness(locked_url: &Url, installed_dist: &InstalledDist) -> miette::Result<bool> {
+    if let Ok(archive) = locked_url.to_file_path() {
+        // This checks the entrypoints like `pyproject.toml`, `setup.cfg`, and
+        // `setup.py` against the METADATA of the installed distribution
+        if ArchiveTimestamp::up_to_date_with(&archive, ArchiveTarget::Install(installed_dist))
+            .into_diagnostic()?
         {
-            // Remove from the desired list of packages to install & from the packages to uninstall.
-            desired_python_packages.remove(found_desired_packages_idx);
-            false
+            tracing::debug!("Requirement already satisfied (and up-to-date): {installed_dist}");
+            Ok(true)
         } else {
-            // Only if this package was previously installed by us do we remove it.
-            current_python_packages.installer.as_deref() == Some(PIXI_PYPI_INSTALLER)
+            tracing::debug!("Requirement already satisfied (but not up-to-date): {installed_dist}");
+            Ok(false)
         }
-    });
-
-    (
-        current_python_packages,
-        desired_python_packages
-            .into_iter()
-            .map(|(pkg, _)| pkg)
-            .collect(),
-    )
+    } else {
+        // Otherwise, assume the requirement is up-to-date.
+        tracing::debug!("Requirement already satisfied (assumed up-to-date): {installed_dist}");
+        Ok(true)
+    }
 }
 
-/// Determine the wheel tags for the locked dependencies. These are extracted by looking at the url
-/// of the locked dependency. The filename of the URL is converted to a wheel name and the tags are
-/// extract from that.
-///
-/// If the locked dependency is not a wheel distribution `None` is returned for the tags. If the
-/// the wheel name could not be parsed `None` is returned for the tags and a warning is emitted.
-fn extract_locked_tags(
-    desired_python_packages: Vec<&LockedDependency>,
-) -> Vec<(&LockedDependency, Option<IndexSet<WheelTag>>)> {
-    desired_python_packages
-        .into_iter()
-        .map(|pkg| {
-            // Get the package as a pip package. If the package is not a pip package we can just ignore it.
-            let Some(pip) = pkg.as_pypi() else { return (pkg, None); };
+/// Check if a package needs to be reinstalled
+fn need_reinstall(
+    installed: &InstalledDist,
+    locked: &PypiPackageData,
+    python_version: &Version,
+) -> miette::Result<ValidateInstall> {
+    // Check if the installed version is the same as the required version
+    match installed {
+        InstalledDist::Registry(reg) => {
+            if reg.version != locked.version {
+                tracing::debug!(
+                    "Installed version {} does not match locked version {}",
+                    reg.version,
+                    locked.version
+                );
+                return Ok(ValidateInstall::Reinstall);
+            }
+        }
 
-            // Extract the filename from the url and the name from the package name.
-            let Some(filename) = pip.url.path_segments().and_then(|s| s.last()) else {
-                tracing::warn!(
-                        "failed to determine the artifact name of the python package {}-{} from url {}: the url has no filename.",
-                        &pkg.name, pkg.version, &pip.url);
-                return (pkg, None);
-            };
-            let Ok(name) = NormalizedPackageName::from_str(&pkg.name) else {
-                tracing::warn!(
-                        "failed to determine the artifact name of the python package {}-{} from url {}: {} is not a valid package name.",
-                        &pkg.name, pkg.version, &pip.url, &pkg.name);
-                return (pkg, None);
-            };
-
-            // Determine the artifact type from the name and filename
-            match ArtifactName::from_filename(filename, &name) {
-                Ok(ArtifactName::Wheel(name)) => (pkg, Some(IndexSet::from_iter(name.all_tags_iter()))),
-                Ok(_) => (pkg, None),
+        // For installed distributions check the direct_url.json to check if a re-install is needed
+        InstalledDist::Url(direct_url) => {
+            let direct_url_json = match InstalledDist::direct_url(&direct_url.path) {
+                Ok(Some(direct_url)) => direct_url,
+                Ok(None) => {
+                    tracing::warn!(
+                        "could not find direct_url.json in {}",
+                        direct_url.path.display()
+                    );
+                    return Ok(ValidateInstall::Reinstall);
+                }
                 Err(err) => {
                     tracing::warn!(
-                        "failed to determine the artifact name of the python package {}-{}. Could not determine the name from the url {}: {err}",
-                        &pkg.name, pkg.version, &pip.url);
-                    (pkg, None)
+                        "could not read direct_url.json in {}: {}",
+                        direct_url.path.display(),
+                        err
+                    );
+                    return Ok(ValidateInstall::Reinstall);
+                }
+            };
+
+            match direct_url_json {
+                pypi_types::DirectUrl::LocalDirectory { url, dir_info } => {
+                    // Recreate file url
+                    let result = Url::parse(&url);
+                    match result {
+                        Ok(url) => {
+                            // Check if the urls are different
+                            if Some(&url) == locked.url_or_path.as_url() {
+                                // Check cache freshness
+                                if !check_url_freshness(&url, installed)? {
+                                    return Ok(ValidateInstall::Reinstall);
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            tracing::warn!("could not parse file url: {}", url);
+                            return Ok(ValidateInstall::Reinstall);
+                        }
+                    }
+                    // If editable status changed also re-install
+                    if dir_info.editable.unwrap_or_default() != locked.editable {
+                        return Ok(ValidateInstall::Reinstall);
+                    }
+                }
+                pypi_types::DirectUrl::ArchiveUrl {
+                    url,
+                    // Don't think anything ever fills this?
+                    archive_info: _,
+                    // Subdirectory is either in the url or not supported
+                    subdirectory: _,
+                } => {
+                    let locked_url = match &locked.url_or_path {
+                        // Remove `direct+` scheme if it is there so we can compare the required to
+                        // the installed url
+                        UrlOrPath::Url(url) => strip_direct_scheme(url),
+                        UrlOrPath::Path(_path) => return Ok(ValidateInstall::Reinstall),
+                    };
+
+                    // Try to parse both urls
+                    let installed_url = url.parse::<Url>();
+
+                    // Same here
+                    let installed_url = if let Ok(installed_url) = installed_url {
+                        installed_url
+                    } else {
+                        tracing::warn!(
+                            "could not parse installed url: {}",
+                            installed_url.unwrap_err()
+                        );
+                        return Ok(ValidateInstall::Reinstall);
+                    };
+
+                    if locked_url.as_ref() == &installed_url {
+                        // Check cache freshness
+                        if !check_url_freshness(&locked_url, installed)? {
+                            return Ok(ValidateInstall::Reinstall);
+                        }
+                    }
+                }
+                pypi_types::DirectUrl::VcsUrl {
+                    url,
+                    vcs_info,
+                    subdirectory: _,
+                } => {
+                    let url = Url::parse(&url).into_diagnostic()?;
+                    let git_url = match &locked.url_or_path {
+                        UrlOrPath::Url(url) => ParsedGitUrl::try_from(url.clone()),
+                        UrlOrPath::Path(_path) => {
+                            // Previously
+                            return Ok(ValidateInstall::Reinstall);
+                        }
+                    };
+                    match git_url {
+                        Ok(git) => {
+                            // Check the repository base url
+                            if git.url.repository() != &url
+                                // Check the sha from the direct_url.json and the required sha
+                                // Use the uv git url to get the sha
+                                || vcs_info.commit_id != git.url.precise().map(|p| p.to_string())
+                            {
+                                return Ok(ValidateInstall::Reinstall);
+                            }
+                        }
+                        Err(err) => {
+                            tracing::error!("could not parse git url: {}", err);
+                            return Ok(ValidateInstall::Reinstall);
+                        }
+                    }
                 }
             }
-        })
-        .collect()
+        }
+        // Figure out what to do with these
+        InstalledDist::EggInfoFile(_) => {}
+        InstalledDist::EggInfoDirectory(_) => {}
+        InstalledDist::LegacyEditable(_) => {}
+    };
+
+    // Do some extra checks if the version is the same
+    let metadata = if let Ok(metadata) = installed.metadata() {
+        metadata
+    } else {
+        tracing::warn!("could not get metadata for {}", installed.name());
+        // Can't be sure lets reinstall
+        return Ok(ValidateInstall::Reinstall);
+    };
+
+    if let Some(requires_python) = metadata.requires_python {
+        // If the installed package requires a different python version
+        if !requires_python.contains(python_version) {
+            return Ok(ValidateInstall::Reinstall);
+        }
+    }
+
+    Ok(ValidateInstall::Keep)
 }
 
-/// Returns true if the installed python package matches the locked python package. If that is the
-/// case we can assume that the locked python package is already installed.
-fn does_installed_match_locked_package(
-    prefix_root: &Path,
-    installed_python_package: &Distribution,
-    locked_python_package: (&LockedDependency, Option<&IndexSet<WheelTag>>),
-) -> bool {
-    let (pkg, artifact_tags) = locked_python_package;
+/// Figure out what we can link from the cache locally
+/// and what we need to download from the registry.
+/// Also determine what we need to remove.
+fn whats_the_plan<'a>(
+    required: &'a [CombinedPypiPackageData],
+    site_packages: &mut SitePackages,
+    registry_index: &'a mut RegistryWheelIndex<'a>,
+    uv_cache: &Cache,
+    python_version: &Version,
+    lock_file_dir: &Path,
+) -> miette::Result<PixiInstallPlan> {
+    // Create a HashSet of PackageName and Version
+    let mut required_map: std::collections::HashMap<&PackageName, &PypiPackageData> =
+        required.iter().map(|(pkg, _)| (&pkg.name, pkg)).collect();
 
-    // Match on name and version
-    if pkg.name != installed_python_package.name.as_str()
-        || pep440_rs::Version::from_str(&pkg.version).ok().as_ref()
-            != Some(&installed_python_package.version)
-    {
-        return false;
-    }
+    // Packages to be removed
+    let mut extraneous = vec![];
+    // Packages to be installed directly from the cache
+    let mut local = vec![];
+    // Try to install from the registry or direct url or w/e
+    let mut remote = vec![];
+    // Packages that need to be reinstalled
+    // i.e. need to be removed before being installed
+    let mut reinstalls = vec![];
 
-    // If this distribution is installed with pixi we can assume that there is a URL file that
-    // contains the original URL.
-    if installed_python_package.installer.as_deref() == Some("pixi") {
-        let expected_hash = pkg
-            .as_pypi()
-            .and_then(|hash| hash.hash.as_ref())
-            .and_then(|hash| hash.sha256())
-            .map(|sha256| format!("sha256-{:x}", sha256));
-        if let Some(expected_hash) = expected_hash {
-            let hash_path = prefix_root
-                .join(&installed_python_package.dist_info)
-                .join("HASH");
-            if let Ok(actual_hash) = std::fs::read_to_string(hash_path) {
-                return actual_hash == expected_hash;
+    let mut installer_mismatch = vec![];
+
+    // Used to verify if there are any additional .dist-info installed
+    // that should be removed
+    let required_map_copy = required_map.clone();
+
+    // Walk over all installed packages and check if they are required
+    for dist in site_packages.iter() {
+        // Check if we require the package to be installed
+        let pkg = required_map.remove(&dist.name());
+        // Get the installer name
+        let installer = dist
+            .installer()
+            // Empty string if no installer or any other error
+            .map_or(String::new(), |f| f.unwrap_or_default());
+
+        if required_map_copy.contains_key(&dist.name()) && installer != consts::PIXI_UV_INSTALLER {
+            // We are managing the package but something else has installed a version
+            // let's re-install to make sure that we have the **correct** version
+            reinstalls.push(dist.clone());
+            installer_mismatch.push(dist.name().to_string());
+        }
+
+        if let Some(pkg) = pkg {
+            if installer == consts::PIXI_UV_INSTALLER {
+                // Check if we need to reinstall
+                match need_reinstall(dist, pkg, python_version)? {
+                    ValidateInstall::Keep => {
+                        // We are done here
+                        continue;
+                    }
+                    ValidateInstall::Reinstall => {
+                        reinstalls.push(dist.clone());
+                    }
+                }
             }
+
+            // Okay so we need to re-install the package
+            // let's see if we need the remote or local version
+
+            // Check if we need to revalidate the package
+            // then we should get it from the remote
+            if uv_cache.must_revalidate(&pkg.name) {
+                remote.push(convert_to_dist(pkg, lock_file_dir).into_diagnostic()?);
+                continue;
+            }
+
+            // Have we cached the wheel?
+            let wheel = registry_index
+                .get(&pkg.name)
+                .find(|(version, _)| **version == pkg.version);
+            if let Some((_, cached)) = wheel {
+                local.push(CachedDist::Registry(cached.clone()));
+            } else {
+                remote.push(convert_to_dist(pkg, lock_file_dir).into_diagnostic()?);
+            }
+        } else if installer != consts::PIXI_UV_INSTALLER {
+            // Ignore packages that we are not managed by us
+            continue;
+        } else {
+            // Add to the extraneous list
+            // as we do manage it but have no need for it
+            extraneous.push(dist.clone());
         }
     }
 
-    // Try to match the tags of both packages. This turns out to be pretty unreliable because
-    // there are many WHEELS that do not report the tags of their filename correctly in the
-    // WHEEL file.
-    match (artifact_tags, &installed_python_package.tags) {
-        (None, _) | (_, None) => {
-            // One, or both, of the artifacts are not a wheel distribution so we cannot
-            // currently compare them. In that case we always just reinstall.
-            // TODO: Maybe log some info here?
-            // TODO: Add support for more distribution types.
-            false
+    // Now we need to check if we have any packages left in the required_map
+    for pkg in required_map.values() {
+        // Check if we need to revalidate
+        // In that case we need to download from the registry
+        if uv_cache.must_revalidate(&pkg.name) {
+            remote.push(convert_to_dist(pkg, lock_file_dir).into_diagnostic()?);
+            continue;
         }
-        (Some(locked_tags), Some(installed_tags)) => locked_tags == installed_tags,
+
+        // Do we have in the registry cache?
+        let wheel = registry_index
+            .get(&pkg.name)
+            .find(|(version, _)| **version == pkg.version);
+        if let Some((_, cached)) = wheel {
+            // Sure we have it in the cache, lets use that
+            local.push(CachedDist::Registry(cached.clone()));
+        } else {
+            // We need to download from the registry or any url
+            remote.push(convert_to_dist(pkg, lock_file_dir).into_diagnostic()?);
+        }
+    }
+
+    Ok(PixiInstallPlan {
+        local,
+        remote,
+        reinstalls,
+        extraneous,
+        installer_mismatch,
+    })
+}
+
+/// Installs and/or remove python distributions.
+// TODO: refactor arguments in struct
+#[allow(clippy::too_many_arguments)]
+pub async fn update_python_distributions(
+    lock_file_dir: &Path,
+    prefix: &Prefix,
+    conda_package: &[RepoDataRecord],
+    python_packages: &[CombinedPypiPackageData],
+    python_interpreter_path: &Path,
+    system_requirements: &SystemRequirements,
+    uv_context: &UvResolutionContext,
+    pypi_indexes: Option<&PypiIndexes>,
+    environment_variables: &HashMap<String, String>,
+    platform: Platform,
+    non_isolated_packages: Option<Vec<String>>,
+) -> miette::Result<()> {
+    let start = std::time::Instant::now();
+    use pixi_consts::consts::PROJECT_MANIFEST;
+    // Determine the current environment markers.
+    let python_record = conda_package
+        .iter()
+        .find(|r| is_python_record(r))
+        .ok_or_else(|| miette::miette!("could not resolve pypi dependencies because no python interpreter is added to the dependencies of the project.\nMake sure to add a python interpreter to the [dependencies] section of the {PROJECT_MANIFEST}, or run:\n\n\tpixi add python"))?;
+    let tags = get_pypi_tags(platform, system_requirements, &python_record.package_record)?;
+
+    let index_locations = pypi_indexes
+        .map(|indexes| locked_indexes_to_index_locations(indexes, lock_file_dir))
+        .unwrap_or_else(|| Ok(IndexLocations::default()))
+        .into_diagnostic()?;
+
+    let registry_client = Arc::new(
+        RegistryClientBuilder::new(uv_context.cache.clone())
+            .client(uv_context.client.clone())
+            .index_urls(index_locations.index_urls())
+            .keyring(uv_context.keyring_provider)
+            .connectivity(Connectivity::Online)
+            .build(),
+    );
+
+    // Resolve the flat indexes from `--find-links`.
+    let flat_index = {
+        let client = FlatIndexClient::new(&registry_client, &uv_context.cache);
+        let entries = client
+            .fetch(index_locations.flat_index())
+            .await
+            .into_diagnostic()?;
+        FlatIndex::from_entries(
+            entries,
+            Some(&tags),
+            &uv_types::HashStrategy::None,
+            &uv_context.build_options,
+        )
+    };
+
+    let in_memory_index = InMemoryIndex::default();
+    let config_settings = ConfigSettings::default();
+
+    let python_location = prefix.root().join(python_interpreter_path);
+    let interpreter = Interpreter::query(&python_location, &uv_context.cache).into_diagnostic()?;
+
+    tracing::debug!("[Install] Using Python Interpreter: {:?}", interpreter);
+    // Create a custom venv
+    let venv = PythonEnvironment::from_interpreter(interpreter);
+    let non_isolated_packages =
+        isolated_names_to_packages(non_isolated_packages.as_deref()).into_diagnostic()?;
+    let build_isolation = names_to_build_isolation(non_isolated_packages.as_deref(), &venv);
+
+    let git_resolver = GitResolver::default();
+    // Prep the build context.
+    let build_dispatch = BuildDispatch::new(
+        &registry_client,
+        &uv_context.cache,
+        &[],
+        venv.interpreter(),
+        &index_locations,
+        &flat_index,
+        &in_memory_index,
+        &git_resolver,
+        &uv_context.in_flight,
+        IndexStrategy::default(),
+        &config_settings,
+        build_isolation,
+        LinkMode::default(),
+        &uv_context.build_options,
+        None,
+        uv_context.source_strategy,
+        uv_context.concurrency,
+    )
+    .with_build_extra_env_vars(environment_variables.iter());
+
+    let _lock = venv
+        .lock()
+        .into_diagnostic()
+        .with_context(|| "error locking installation directory")?;
+
+    // Find out what packages are already installed
+    let mut site_packages =
+        SitePackages::from_environment(&venv).expect("could not create site-packages");
+
+    tracing::debug!(
+        "Constructed site-packages with {} packages",
+        site_packages.iter().count(),
+    );
+
+    // This is used to find wheels that are available from the registry
+    let mut registry_index = RegistryWheelIndex::new(
+        &uv_context.cache,
+        &tags,
+        &index_locations,
+        &HashStrategy::None,
+    );
+
+    tracing::debug!("Figuring out what to install/reinstall/remove");
+    // Partition into those that should be linked from the cache (`local`), those
+    // that need to be downloaded (`remote`), and those that should be removed
+    // (`extraneous`).
+    let PixiInstallPlan {
+        local,
+        remote,
+        reinstalls,
+        extraneous,
+        mut installer_mismatch,
+    } = whats_the_plan(
+        python_packages,
+        &mut site_packages,
+        &mut registry_index,
+        &uv_context.cache,
+        venv.interpreter().python_version(),
+        lock_file_dir,
+    )?;
+
+    // Determine the currently installed conda packages.
+    let installed_packages = prefix
+        .find_installed_packages(None)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to determine the currently installed packages for {}",
+                prefix.root().display()
+            )
+        })?;
+
+    let pypi_conda_clobber = PypiCondaClobberRegistry::with_conda_packages(&installed_packages);
+
+    // Nothing to do.
+    if remote.is_empty() && local.is_empty() && reinstalls.is_empty() && extraneous.is_empty() {
+        let s = if python_packages.len() == 1 { "" } else { "s" };
+        tracing::info!(
+            "{}",
+            format!(
+                "Nothing to do - Audited {} in {}",
+                format!(
+                    "{num_requirements} distribution{s}",
+                    num_requirements = python_packages.len()
+                ),
+                elapsed(start.elapsed())
+            )
+        );
+        return Ok(());
+    }
+
+    // Some info logging
+    // List all package names that are going to be installed, re-installed and
+    // removed
+    tracing::info!(
+        "resolved install plan: local={}, remote={}, reinstalls={}, extraneous={}",
+        local.len(),
+        remote.len(),
+        reinstalls.len(),
+        extraneous.len()
+    );
+    let to_install = local
+        .iter()
+        .map(|d| d.name().to_string())
+        .chain(remote.iter().map(|d| d.name().to_string()))
+        .collect::<Vec<String>>();
+
+    let reinstall = reinstalls
+        .iter()
+        .map(|d| d.name().to_string())
+        .collect::<Vec<String>>();
+
+    let remove = extraneous
+        .iter()
+        .map(|d| d.name().to_string())
+        .collect::<Vec<String>>();
+
+    tracing::info!("Install: {to_install:?}");
+    tracing::info!("Re-install: {reinstall:?}");
+    tracing::info!("Remove: {remove:?}");
+
+    // Download, build, and unzip any missing distributions.
+    let wheels = if remote.is_empty() {
+        Vec::new()
+    } else {
+        let start = std::time::Instant::now();
+
+        let options = UvReporterOptions::new()
+            .with_length(remote.len() as u64)
+            .with_capacity(remote.len() + 30)
+            .with_starting_tasks(remote.iter().map(|d| format!("{}", d.name())))
+            .with_top_level_message("Preparing distributions");
+
+        let distribution_database = DistributionDatabase::new(
+            registry_client.as_ref(),
+            &build_dispatch,
+            uv_context.concurrency.downloads,
+        );
+
+        // Before hitting the network let's make sure the credentials are available to
+        // uv
+        for url in index_locations.urls() {
+            let success = store_credentials_from_url(url);
+            tracing::debug!("Stored credentials for {}: {}", url, success);
+        }
+
+        let preparer = Preparer::new(
+            &uv_context.cache,
+            &tags,
+            &uv_types::HashStrategy::None,
+            &uv_context.build_options,
+            distribution_database,
+        )
+        .with_reporter(UvReporter::new(options));
+
+        let wheels = preparer
+            .prepare(remote.clone(), &uv_context.in_flight)
+            .await
+            .into_diagnostic()
+            .context("Failed to prepare distributions")?;
+
+        let s = if wheels.len() == 1 { "" } else { "s" };
+        tracing::info!(
+            "{}",
+            format!(
+                "Prepared {} in {}",
+                format!("{} package{}", wheels.len(), s),
+                elapsed(start.elapsed())
+            )
+        );
+
+        wheels
+    };
+
+    // Remove any unnecessary packages.
+    if !extraneous.is_empty() || !reinstalls.is_empty() {
+        let start = std::time::Instant::now();
+
+        for dist_info in extraneous.iter().chain(reinstalls.iter()) {
+            let summary = match uv_installer::uninstall(dist_info).await {
+                Ok(sum) => sum,
+                // Get error types from uv_installer
+                Err(UninstallError::Uninstall(e))
+                    if matches!(e, install_wheel_rs::Error::MissingRecord(_))
+                        || matches!(e, install_wheel_rs::Error::MissingTopLevel(_)) =>
+                {
+                    // If the uninstallation failed, remove the directory manually and continue
+                    tracing::debug!("Uninstall failed for {:?} with error: {}", dist_info, e);
+
+                    // Sanity check to avoid calling remove all on a bad path.
+                    if dist_info
+                        .path()
+                        .iter()
+                        .any(|segment| Path::new(segment) == Path::new("site-packages"))
+                    {
+                        tokio::fs::remove_dir_all(dist_info.path())
+                            .await
+                            .into_diagnostic()?;
+                    }
+
+                    continue;
+                }
+                Err(err) => {
+                    return Err(miette::miette!(err));
+                }
+            };
+            tracing::debug!(
+                "Uninstalled {} ({} file{}, {} director{})",
+                dist_info.name(),
+                summary.file_count,
+                if summary.file_count == 1 { "" } else { "s" },
+                summary.dir_count,
+                if summary.dir_count == 1 { "y" } else { "ies" },
+            );
+        }
+
+        let s = if extraneous.len() + reinstalls.len() == 1 {
+            ""
+        } else {
+            "s"
+        };
+        tracing::debug!(
+            "{}",
+            format!(
+                "Uninstalled {} in {}",
+                format!("{} package{}", extraneous.len() + reinstalls.len(), s),
+                elapsed(start.elapsed())
+            )
+        );
+    }
+
+    // Install the resolved distributions.
+    let wheels = wheels.into_iter().chain(local).collect::<Vec<_>>();
+
+    // Verify if pypi wheels will override existing conda packages
+    // and warn if they are
+    if let Ok(Some(clobber_packages)) =
+        pypi_conda_clobber.clobber_on_installation(wheels.clone(), &venv)
+    {
+        let packages_names = clobber_packages.iter().join(", ");
+
+        tracing::warn!("These conda-packages will be overridden by pypi: \n\t{packages_names}");
+
+        // because we are removing conda packages
+        // we filter the ones we already warn
+        if !installer_mismatch.is_empty() {
+            installer_mismatch.retain(|name| !packages_names.contains(name));
+        }
+    }
+
+    if !installer_mismatch.is_empty() {
+        // Notify the user if there are any packages that were re-installed because they
+        // were installed by a different installer.
+        let packages = installer_mismatch
+            .iter()
+            .map(|name| name.to_string())
+            .join(", ");
+        // BREAK(0.20.1): change this into a warning in a future release
+        tracing::info!("These pypi-packages were re-installed because they were previously installed by a different installer but are currently managed by pixi: \n\t{packages}")
+    }
+
+    let options = UvReporterOptions::new()
+        .with_length(wheels.len() as u64)
+        .with_capacity(wheels.len() + 30)
+        .with_starting_tasks(wheels.iter().map(|d| format!("{}", d.name())))
+        .with_top_level_message("Installing distributions");
+
+    if !wheels.is_empty() {
+        let start = std::time::Instant::now();
+        uv_installer::Installer::new(&venv)
+            .with_link_mode(LinkMode::default())
+            .with_installer_name(Some(consts::PIXI_UV_INSTALLER.to_string()))
+            .with_reporter(UvReporter::new(options))
+            .install(wheels.clone())
+            .await
+            .unwrap();
+
+        let s = if wheels.len() == 1 { "" } else { "s" };
+        tracing::info!(
+            "{}",
+            format!(
+                "Installed {} in {}",
+                format!("{} package{}", wheels.len(), s),
+                elapsed(start.elapsed())
+            )
+        );
+    }
+
+    Ok(())
+}
+
+/// Returns `true` if the source tree at the given path contains dynamic
+/// metadata.
+#[allow(dead_code)]
+fn is_dynamic(path: &Path) -> bool {
+    // return true;
+    // If there's no `pyproject.toml`, we assume it's dynamic.
+    let Ok(contents) = fs::read_to_string(path.join("pyproject.toml")) else {
+        return true;
+    };
+    let Ok(pyproject_toml) = PyProjectManifest::from_toml_str(&contents) else {
+        return true;
+    };
+    // // If `[project]` is not present, we assume it's dynamic.
+    let Some(project) = pyproject_toml.project() else {
+        // ...unless it appears to be a Poetry project.
+        return pyproject_toml.poetry().is_none();
+    };
+    // `[project.dynamic]` must be present and non-empty.
+    project
+        .dynamic
+        .as_ref()
+        .is_some_and(|dynamic| !dynamic.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{path::PathBuf, str::FromStr};
+
+    use distribution_types::RemoteSource;
+    use pep440_rs::Version;
+    use rattler_lock::{PypiPackageData, UrlOrPath};
+
+    use super::convert_to_dist;
+
+    #[test]
+    /// Create locked pypi data, pass this into the convert_to_dist function
+    fn convert_special_chars_wheelname_to_dist() {
+        // Create url with special characters
+        let wheel = "torch-2.3.0%2Bcu121-cp312-cp312-win_amd64.whl";
+        let url = format!("https://example.com/{}", wheel).parse().unwrap();
+        // Pass into locked data
+        let locked = PypiPackageData {
+            name: "torch".parse().unwrap(),
+            version: Version::from_str("2.3.0+cu121").unwrap(),
+            url_or_path: UrlOrPath::Url(url),
+            hash: None,
+            requires_dist: vec![],
+            requires_python: None,
+            editable: false,
+        };
+
+        // Convert the locked data to a uv dist
+        // check if it does not panic
+        let dist = convert_to_dist(&locked, &PathBuf::new())
+            .expect("could not convert wheel with special chars to dist");
+
+        // Check if the dist is a built dist
+        assert!(!dist.filename().unwrap().contains("%2B"));
     }
 }

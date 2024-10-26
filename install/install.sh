@@ -1,19 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Version: v0.34.0
 
 __wrap__() {
 
-VERSION=${PIXI_VERSION:-latest}
-INSTALL_DIR=${PIXI_DIR:-"$HOME/.pixi/bin"}
+VERSION="${PIXI_VERSION:-latest}"
+PIXI_HOME="${PIXI_HOME:-$HOME/.pixi}"
+PIXI_HOME="${PIXI_HOME/#\~/$HOME}"
+BIN_DIR="$PIXI_HOME/bin"
 
-REPO=prefix-dev/pixi
-PLATFORM=$(uname -s)
-ARCH=$(uname -m)
+REPO="prefix-dev/pixi"
+PLATFORM="$(uname -s)"
+ARCH="${PIXI_ARCH:-$(uname -m)}"
 
 if [[ $PLATFORM == "Darwin" ]]; then
   PLATFORM="apple-darwin"
 elif [[ $PLATFORM == "Linux" ]]; then
   PLATFORM="unknown-linux-musl"
+elif [[ $(uname -o) == "Msys" ]]; then
+  PLATFORM="pc-windows-msvc"
 fi
 
 if [[ $ARCH == "arm64" ]] || [[ $ARCH == "aarch64" ]]; then
@@ -23,17 +28,21 @@ fi
 
 
 BINARY="pixi-${ARCH}-${PLATFORM}"
-
-if [[ $VERSION == "latest" ]]; then
-  DOWNLOAD_URL=https://github.com/${REPO}/releases/latest/download/${BINARY}.tar.gz
-else
-  DOWNLOAD_URL=https://github.com/${REPO}/releases/download/${VERSION}/${BINARY}.tar.gz
+EXTENSION="tar.gz"
+if [[ $(uname -o) == "Msys" ]]; then
+  EXTENSION="zip"
 fi
 
-printf "This script will automatically download and install Pixi (${VERSION}) for you.\nGetting it from this url: $DOWNLOAD_URL\nThe binary will be installed into '$INSTALL_DIR'\n"
+if [[ $VERSION == "latest" ]]; then
+  DOWNLOAD_URL="https://github.com/${REPO}/releases/latest/download/${BINARY}.${EXTENSION}"
+else
+  DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${VERSION}/${BINARY}.${EXTENSION}"
+fi
 
-if ! hash curl 2> /dev/null; then
-  echo "error: you do not have 'curl' installed which is required for this script."
+printf "This script will automatically download and install Pixi (${VERSION}) for you.\nGetting it from this url: $DOWNLOAD_URL\n"
+
+if ! hash curl 2> /dev/null && ! hash wget 2> /dev/null; then
+  echo "error: you need either 'curl' or 'wget' installed for this script."
   exit 1
 fi
 
@@ -42,7 +51,7 @@ if ! hash tar 2> /dev/null; then
   exit 1
 fi
 
-TEMP_FILE=$(mktemp "${TMPDIR:-/tmp}/.pixi_install.XXXXXXXX")
+TEMP_FILE="$(mktemp "${TMPDIR:-/tmp}/.pixi_install.XXXXXXXX")"
 
 cleanup() {
   rm -f "$TEMP_FILE"
@@ -50,26 +59,52 @@ cleanup() {
 
 trap cleanup EXIT
 
-HTTP_CODE=$(curl -SL --progress-bar "$DOWNLOAD_URL" --output "$TEMP_FILE" --write-out "%{http_code}")
-if [[ ${HTTP_CODE} -lt 200 || ${HTTP_CODE} -gt 299 ]]; then
-  echo "error: '${DOWNLOAD_URL}' is not available"
-  exit 1
+# Test if stdout is a terminal before showing progress
+if [[ ! -t 1 ]]; then
+  CURL_OPTIONS="--no-progress-meter"
+  WGET_OPTIONS="--no-verbose"
+else
+  CURL_OPTIONS="--progress-bar"
+  WGET_OPTIONS="--show-progress"
+fi
+
+if hash curl 2> /dev/null; then
+  HTTP_CODE="$(curl -SL $CURL_OPTIONS "$DOWNLOAD_URL" --output "$TEMP_FILE" --write-out "%{http_code}")"
+  if [[ "${HTTP_CODE}" -lt 200 || "${HTTP_CODE}" -gt 299 ]]; then
+    echo "error: '${DOWNLOAD_URL}' is not available"
+    exit 1
+  fi
+elif hash wget 2> /dev/null; then
+  if ! wget $WGET_OPTIONS --output-document="$TEMP_FILE" "$DOWNLOAD_URL"; then
+    echo "error: '${DOWNLOAD_URL}' is not available"
+    exit 1
+  fi
 fi
 
 # Check that file was correctly created (https://github.com/prefix-dev/pixi/issues/446)
-if [[ ! -s $TEMP_FILE ]]; then
+if [[ ! -s "$TEMP_FILE" ]]; then
   echo "error: temporary file ${TEMP_FILE} not correctly created."
   echo "       As a workaround, you can try set TMPDIR env variable to directory with write permissions."
   exit 1
 fi
 
-# Extract pixi from the downloaded tar file
-mkdir -p "$INSTALL_DIR"
-tar -xzf "$TEMP_FILE" -C "$INSTALL_DIR"
+# Extract pixi from the downloaded file
+mkdir -p "$BIN_DIR"
+if [[ "$(uname -o)" == "Msys" ]]; then
+  unzip "$TEMP_FILE" -d "$BIN_DIR"
+else
+  tar -xzf "$TEMP_FILE" -C "$BIN_DIR"
+  chmod +x "$BIN_DIR/pixi"
+fi
+
+echo "The 'pixi' binary is installed into '${BIN_DIR}'"
 
 update_shell() {
-    FILE=$1
-    LINE=$2
+    FILE="$1"
+    LINE="$2"
+
+    # shell update can be suppressed by `PIXI_NO_PATH_UPDATE` env var
+    [[ ! -z "${PIXI_NO_PATH_UPDATE:-}" ]] && echo "No path update because PIXI_NO_PATH_UPDATE has a value" && return
 
     # Create the file if it doesn't exist
     if [ -f "$FILE" ]; then
@@ -81,37 +116,36 @@ update_shell() {
     then
         echo "Updating '${FILE}'"
         echo "$LINE" >> "$FILE"
+        echo "Please restart or source your shell."
     fi
 }
+
 case "$(basename "$SHELL")" in
     bash)
-        if [ -f ~/.bash_profile ]; then
-            BASH_FILE=~/.bash_profile
-        else
-            # Default to bashrc as that is used in non login shells instead of the profile.
-            BASH_FILE=~/.bashrc
-        fi
-        LINE="export PATH=\$PATH:${INSTALL_DIR}"
-        update_shell $BASH_FILE "$LINE"
+        # Default to bashrc as that is used in non login shells instead of the profile.
+        LINE="export PATH=\"${BIN_DIR}:\$PATH\""
+        update_shell ~/.bashrc "$LINE"
         ;;
 
     fish)
-        LINE="fish_add_path ${INSTALL_DIR}"
+        LINE="fish_add_path ${BIN_DIR}"
         update_shell ~/.config/fish/config.fish "$LINE"
         ;;
 
     zsh)
-        LINE="export PATH=\$PATH:${INSTALL_DIR}"
+        LINE="export PATH=\"${BIN_DIR}:\$PATH\""
         update_shell ~/.zshrc "$LINE"
         ;;
 
+    tcsh)
+        LINE="set path = ( ${BIN_DIR} \$path )"
+        update_shell ~/.tcshrc "$LINE"
+        ;;
+
     *)
-        echo "Unsupported shell: $(basename "$0")"
+        echo "Could not update shell: $(basename "$SHELL")"
+        echo "Please permanently add '${BIN_DIR}' to your \$PATH to enable the 'pixi' command."
         ;;
 esac
-
-chmod +x "$INSTALL_DIR/pixi"
-
-echo "Please restart or source your shell."
 
 }; __wrap__

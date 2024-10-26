@@ -1,21 +1,32 @@
-use crate::{
-    task::{quote_arguments, CmdArgs, Custom, Task},
-    Project,
-};
-use deno_task_shell::{
-    execute_with_pipes, parser::SequentialList, pipe, ShellPipeWriter, ShellState,
-};
-use miette::Diagnostic;
-use rattler_conda_types::Platform;
 use std::{
     borrow::Cow,
     collections::HashMap,
-    env,
     fmt::{Display, Formatter},
     path::PathBuf,
 };
+
+use deno_task_shell::{
+    execute_with_pipes, parser::SequentialList, pipe, ShellPipeWriter, ShellState,
+};
+use itertools::Itertools;
+use miette::{Context, Diagnostic, IntoDiagnostic};
 use thiserror::Error;
 use tokio::task::JoinHandle;
+
+use super::task_hash::{InputHashesError, TaskCache, TaskHash};
+use crate::{
+    lock_file::LockFileDerivedData,
+    project::Environment,
+    task::task_graph::{TaskGraph, TaskId},
+    Project,
+};
+use pixi_consts::consts;
+
+use crate::activation::CurrentEnvVarBehavior;
+use crate::project::virtual_packages::verify_current_platform_has_required_virtual_packages;
+use crate::project::HasProjectRef;
+use pixi_manifest::{Task, TaskName};
+use pixi_progress::await_in_progress;
 
 /// Runs task in project.
 #[derive(Default, Debug)]
@@ -26,13 +37,7 @@ pub struct RunOutput {
 }
 
 #[derive(Debug, Error, Diagnostic)]
-#[error("could not find the task '{task_name}'")]
-pub struct MissingTaskError {
-    pub task_name: String,
-}
-
-#[derive(Debug, Error, Diagnostic)]
-#[error("deno task shell failed to parse '{script}': {error}")]
+#[error("The task failed to parse. task: '{script}' error: '{error}'")]
 pub struct FailedToParseShellScript {
     pub script: String,
     pub error: String,
@@ -48,103 +53,115 @@ pub struct InvalidWorkingDirectory {
 pub enum TaskExecutionError {
     #[error(transparent)]
     InvalidWorkingDirectory(#[from] InvalidWorkingDirectory),
+
     #[error(transparent)]
     FailedToParseShellScript(#[from] FailedToParseShellScript),
 }
 
-/// A task that contains enough information to be able to execute it. The lifetime [`'p`] refers to
-/// the lifetime of the project that contains the tasks.
+#[derive(Debug, Error, Diagnostic)]
+pub enum CacheUpdateError {
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+
+    #[error(transparent)]
+    TaskHashError(#[from] InputHashesError),
+
+    #[error("failed to serialize cache")]
+    Serialization(#[from] serde_json::Error),
+}
+
+pub enum CanSkip {
+    Yes,
+    No(Option<TaskHash>),
+}
+
+/// A task that contains enough information to be able to execute it. The
+/// lifetime [`'p`] refers to the lifetime of the project that contains the
+/// tasks.
 #[derive(Clone)]
 pub struct ExecutableTask<'p> {
-    pub(super) project: &'p Project,
-    pub(super) name: Option<String>,
-    pub(super) task: Cow<'p, Task>,
-    pub(super) additional_args: Vec<String>,
-    pub(super) platform: Option<Platform>,
+    pub project: &'p Project,
+    pub name: Option<TaskName>,
+    pub task: Cow<'p, Task>,
+    pub run_environment: Environment<'p>,
+    pub additional_args: Vec<String>,
 }
 
 impl<'p> ExecutableTask<'p> {
+    /// Constructs a new executable task from a task graph node.
+    pub fn from_task_graph(task_graph: &TaskGraph<'p>, task_id: TaskId) -> Self {
+        let node = &task_graph[task_id];
+        Self {
+            project: task_graph.project(),
+            name: node.name.clone(),
+            task: node.task.clone(),
+            run_environment: node.run_environment.clone(),
+            additional_args: node.additional_args.clone(),
+        }
+    }
+
     /// Returns the name of the task or `None` if this is an anonymous task.
-    pub fn name(&self) -> Option<&str> {
-        self.name.as_deref()
+    pub(crate) fn name(&self) -> Option<&str> {
+        self.name.as_ref().map(|name| name.as_str())
     }
 
     /// Returns the task description from the project.
-    pub fn task(&self) -> &Task {
+    pub(crate) fn task(&self) -> &Task {
         self.task.as_ref()
     }
 
-    /// Returns any additional args to pass to the execution of the task.
-    pub fn additional_args(&self) -> &[String] {
-        &self.additional_args
-    }
-
     /// Returns the project in which this task is defined.
-    pub fn project(&self) -> &'p Project {
+    pub(crate) fn project(&self) -> &'p Project {
         self.project
     }
 
-    /// Parses command line arguments into an [`ExecutableTask`].
-    pub fn from_cmd_args(
-        project: &'p Project,
-        args: Vec<String>,
-        platform: Option<Platform>,
-    ) -> Self {
-        let mut args = args;
-
-        if let Some(name) = args.first() {
-            // Find the task in the project. First searches for platform specific tasks and falls
-            // back to looking for the task in the default tasks.
-            if let Some(task) = project.task_opt(name, platform) {
-                return Self {
-                    project,
-                    name: Some(args.remove(0)),
-                    task: Cow::Borrowed(task),
-                    additional_args: args,
-                    platform,
-                };
-            }
-        }
-
-        // When no task is found, just execute the command verbatim.
-        Self {
-            project,
-            name: None,
-            task: Cow::Owned(
-                Custom {
-                    cmd: CmdArgs::from(args),
-                    cwd: env::current_dir().ok(),
-                }
-                .into(),
-            ),
-            additional_args: vec![],
-            platform,
-        }
-    }
-
-    /// Returns a [`SequentialList`] which can be executed by deno task shell. Returns `None` if the
-    /// command is not executable like in the case of an alias.
-    pub fn as_deno_script(&self) -> Result<Option<SequentialList>, FailedToParseShellScript> {
+    /// Returns the task as script
+    fn as_script(&self) -> Option<String> {
         // Convert the task into an executable string
-        let Some(task) = self.task.as_single_command() else {
-            return Ok(None);
+        let task = self.task.as_single_command()?;
+
+        // Get the export specific environment variables
+        let export = get_export_specific_task_env(self.task.as_ref());
+
+        // Append the command line arguments verbatim
+        let cli_args = self
+            .additional_args
+            .iter()
+            .format_with(" ", |arg, f| f(&format_args!("'{}'", arg)));
+
+        // Skip the export if it's empty, to avoid newlines
+        let full_script = if export.is_empty() {
+            format!("{task} {cli_args}")
+        } else {
+            format!("{export}\n{task} {cli_args}")
         };
 
-        // Append the command line arguments
-        let cli_args = quote_arguments(self.additional_args.iter().map(|arg| arg.as_str()));
-        let full_script = format!("{task} {cli_args}");
+        Some(full_script)
+    }
 
-        // Parse the shell command
-        deno_task_shell::parser::parse(full_script.trim())
-            .map_err(|e| FailedToParseShellScript {
-                script: full_script,
-                error: e.to_string(),
-            })
-            .map(Some)
+    /// Returns a [`SequentialList`] which can be executed by deno task shell.
+    /// Returns `None` if the command is not executable like in the case of
+    /// an alias.
+    pub(crate) fn as_deno_script(
+        &self,
+    ) -> Result<Option<SequentialList>, FailedToParseShellScript> {
+        if let Some(full_script) = self.as_script() {
+            tracing::debug!("Parsing shell script: {}", full_script);
+
+            // Parse the shell command
+            deno_task_shell::parser::parse(full_script.trim())
+                .map_err(|e| FailedToParseShellScript {
+                    script: full_script,
+                    error: e.to_string(),
+                })
+                .map(Some)
+        } else {
+            Ok(None)
+        }
     }
 
     /// Returns the working directory for this task.
-    pub fn working_directory(&self) -> Result<PathBuf, InvalidWorkingDirectory> {
+    pub(crate) fn working_directory(&self) -> Result<PathBuf, InvalidWorkingDirectory> {
         Ok(match self.task.working_directory() {
             Some(cwd) if cwd.is_absolute() => cwd.to_path_buf(),
             Some(cwd) => {
@@ -160,8 +177,26 @@ impl<'p> ExecutableTask<'p> {
         })
     }
 
-    /// Returns an object that implements [`Display`] which outputs the command of the wrapped task.
-    pub fn display_command(&self) -> impl Display + '_ {
+    /// Returns the full command that should be executed for this task. This
+    /// includes any additional arguments that should be passed to the
+    /// command.
+    ///
+    /// This function returns `None` if the task does not define a command to
+    /// execute. This is the case for alias only commands.
+    pub(crate) fn full_command(&self) -> Option<String> {
+        let mut cmd = self.task.as_single_command()?.to_string();
+
+        if !self.additional_args.is_empty() {
+            cmd.push(' ');
+            cmd.push_str(&self.additional_args.join(" "));
+        }
+
+        Some(cmd)
+    }
+
+    /// Returns an object that implements [`Display`] which outputs the command
+    /// of the wrapped task.
+    pub(crate) fn display_command(&self) -> impl Display + '_ {
         ExecutableTaskConsoleDisplay { task: self }
     }
 
@@ -194,10 +229,76 @@ impl<'p> ExecutableTask<'p> {
             stderr: stderr_handle.await.unwrap(),
         })
     }
+
+    /// We store the hashes of the inputs and the outputs of the task in a file
+    /// in the cache. The current name is something like
+    /// `run_environment-task_name.json`.
+    pub(crate) fn cache_name(&self) -> String {
+        format!(
+            "{}-{}.json",
+            self.run_environment.name(),
+            self.name().unwrap_or("default")
+        )
+    }
+
+    /// Checks if the task can be skipped. If the task can be skipped, it
+    /// returns `CanSkip::Yes`. If the task cannot be skipped, it returns
+    /// `CanSkip::No` and includes the hash of the task that caused the task
+    /// to not be skipped - we can use this later to update the cache file
+    /// quickly.
+    pub(crate) async fn can_skip(
+        &self,
+        lock_file: &LockFileDerivedData<'p>,
+    ) -> Result<CanSkip, std::io::Error> {
+        tracing::info!("Checking if task can be skipped");
+        let cache_name = self.cache_name();
+        let cache_file = self.project().task_cache_folder().join(cache_name);
+        if cache_file.exists() {
+            let cache = tokio::fs::read_to_string(&cache_file).await?;
+            let cache: TaskCache = serde_json::from_str(&cache)?;
+            let hash = TaskHash::from_task(self, &lock_file.lock_file).await;
+            if let Ok(Some(hash)) = hash {
+                if hash.computation_hash() != cache.hash {
+                    return Ok(CanSkip::No(Some(hash)));
+                } else {
+                    return Ok(CanSkip::Yes);
+                }
+            }
+        }
+        Ok(CanSkip::No(None))
+    }
+
+    /// Saves the cache of the task. This function will update the cache file
+    /// with the new hash of the task (inputs and outputs). If the task has
+    /// no hash, it will not save the cache.
+    pub(crate) async fn save_cache(
+        &self,
+        lock_file: &LockFileDerivedData<'_>,
+        previous_hash: Option<TaskHash>,
+    ) -> Result<(), CacheUpdateError> {
+        let task_cache_folder = self.project().task_cache_folder();
+        let cache_file = task_cache_folder.join(self.cache_name());
+        let new_hash = if let Some(mut previous_hash) = previous_hash {
+            previous_hash.update_output(self).await?;
+            previous_hash
+        } else if let Some(hash) = TaskHash::from_task(self, &lock_file.lock_file).await? {
+            hash
+        } else {
+            return Ok(());
+        };
+
+        tokio::fs::create_dir_all(&task_cache_folder).await?;
+
+        let cache = TaskCache {
+            hash: new_hash.computation_hash(),
+        };
+        let cache = serde_json::to_string(&cache)?;
+        Ok(tokio::fs::write(&cache_file, cache).await?)
+    }
 }
 
-/// A helper object that implements [`Display`] to display (with ascii color) the command of the
-/// task.
+/// A helper object that implements [`Display`] to display (with ascii color)
+/// the command of the task.
 struct ExecutableTaskConsoleDisplay<'p, 't> {
     task: &'t ExecutableTask<'p>,
 }
@@ -208,15 +309,15 @@ impl<'p, 't> Display for ExecutableTaskConsoleDisplay<'p, 't> {
         write!(
             f,
             "{}",
-            console::style(command.as_deref().unwrap_or("<alias>"))
-                .blue()
+            consts::TASK_STYLE
+                .apply_to(command.as_deref().unwrap_or("<alias>"))
                 .bold()
         )?;
         if !self.task.additional_args.is_empty() {
             write!(
                 f,
                 " {}",
-                console::style(self.task.additional_args.join(" ")).blue()
+                consts::TASK_STYLE.apply_to(self.task.additional_args.iter().format(" "))
             )?;
         }
         Ok(())
@@ -229,150 +330,154 @@ fn get_output_writer_and_handle() -> (ShellPipeWriter, JoinHandle<String>) {
     (writer, handle)
 }
 
+/// Task specific environment variables.
+fn get_export_specific_task_env(task: &Task) -> String {
+    // Append the environment variables if they don't exist
+    let mut export = String::new();
+    if let Some(env) = task.env() {
+        for (key, value) in env {
+            if value.contains(format!("${}", key).as_str()) || std::env::var(key.as_str()).is_err()
+            {
+                tracing::info!("Setting environment variable: {}=\"{}\"", key, value);
+                export.push_str(&format!("export \"{}={}\";\n", key, value));
+            } else {
+                tracing::info!("Environment variable {} already set", key);
+            }
+        }
+    }
+    export
+}
+
+/// Determine the environment variables to use when executing a command. The method combines the
+/// activation environment with the system environment variables.
+pub async fn get_task_env<'p>(
+    environment: &Environment<'p>,
+    clean_env: bool,
+) -> miette::Result<HashMap<String, String>> {
+    // Make sure the system requirements are met
+    verify_current_platform_has_required_virtual_packages(environment).into_diagnostic()?;
+
+    // Get environment variables from the activation
+    let env_var_behavior = if clean_env {
+        CurrentEnvVarBehavior::Clean
+    } else {
+        CurrentEnvVarBehavior::Include
+    };
+    let mut activation_env = await_in_progress("activating environment", |_| {
+        environment
+            .project()
+            .get_activated_environment_variables(environment, env_var_behavior)
+    })
+    .await
+    .wrap_err("failed to activate environment")?
+    .clone();
+
+    // Add the current working directory to the environment
+    if let Ok(init_cwd) = std::env::current_dir() {
+        activation_env.insert(
+            "INIT_CWD".to_string(),
+            init_cwd.to_string_lossy().to_string(),
+        );
+    } else {
+        tracing::warn!("Failed to get the current working directory for INIT_CWD.");
+    }
+
+    // Concatenate with the system environment variables
+    Ok(activation_env)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::project::manifest::Manifest;
+    use pixi_manifest::Manifest;
     use std::path::Path;
 
-    #[tokio::test]
-    async fn test_ordered_commands() {
-        let file_content = r#"
+    const PROJECT_BOILERPLATE: &str = r#"
         [project]
-        name = "pixi"
-        channels = ["conda-forge"]
-        platforms = ["linux-64"]
-        [tasks]
-        root = "echo root"
-        task1 = {cmd="echo task1", depends_on=["root"]}
-        task2 = {cmd="echo task2", depends_on=["root"]}
-        top = {cmd="echo top", depends_on=["task1","task2"]}
-    "#;
-        let manifest = Manifest::from_str(Path::new(""), file_content.to_string()).unwrap();
-        let project = Project::from_manifest(manifest);
+        name = "foo"
+        version = "0.1.0"
+        channels = []
+        # Required to run tests
+        platforms = ["linux-64", "osx-64", "win-64", "osx-arm64", "linux-ppc64le", "linux-aarch64"]
+        "#;
 
-        let executable_tasks = ExecutableTask::from_cmd_args(
-            &project,
-            vec!["top".to_string(), "--test".to_string()],
-            None,
+    #[test]
+    fn test_export_specific_task_env() {
+        let file_contents = r#"
+            [tasks]
+            test = {cmd = "test", cwd = "tests", env = {FOO = "bar", BAR = "$FOO"}}
+            "#;
+        let manifest = Manifest::from_str(
+            Path::new("pixi.toml"),
+            format!("{PROJECT_BOILERPLATE}\n{file_contents}").as_str(),
         )
-        .get_ordered_dependencies()
-        .await
         .unwrap();
 
-        let ordered_task_names: Vec<_> = executable_tasks
-            .iter()
-            .map(|task| task.task().as_single_command().unwrap())
-            .collect();
+        let project = Project::from_manifest(manifest);
 
-        assert_eq!(
-            ordered_task_names,
-            vec!["echo root", "echo task1", "echo task2", "echo top"]
-        );
+        let task = project
+            .default_environment()
+            .task(&TaskName::from("test"), None)
+            .unwrap();
 
-        // Also check if the arguments are passed correctly
-        assert_eq!(
-            executable_tasks.last().unwrap().additional_args(),
-            vec!["--test".to_string()]
-        );
+        let export = get_export_specific_task_env(task);
+
+        assert_eq!(export, "export \"FOO=bar\";\nexport \"BAR=$FOO\";\n");
+    }
+
+    #[test]
+    fn test_as_script() {
+        let file_contents = r#"
+            [tasks]
+            test = {cmd = "test", cwd = "tests", env = {FOO = "bar"}}
+            "#;
+        let manifest = Manifest::from_str(
+            Path::new("pixi.toml"),
+            format!("{PROJECT_BOILERPLATE}\n{file_contents}").as_str(),
+        )
+        .unwrap();
+
+        let project = Project::from_manifest(manifest);
+
+        let task = project
+            .default_environment()
+            .task(&TaskName::from("test"), None)
+            .unwrap();
+
+        let executable_task = ExecutableTask {
+            project: &project,
+            name: Some("test".into()),
+            task: Cow::Borrowed(task),
+            run_environment: project.default_environment(),
+            additional_args: vec![],
+        };
+
+        let script = executable_task.as_script().unwrap();
+        assert_eq!(script, "export \"FOO=bar\";\n\ntest ");
     }
 
     #[tokio::test]
-    async fn test_cycle_ordered_commands() {
-        let file_content = r#"
-        [project]
-        name = "pixi"
-        channels = ["conda-forge"]
-        platforms = ["linux-64"]
-        [tasks]
-        root = {cmd="echo root", depends_on=["task1"]}
-        task1 = {cmd="echo task1", depends_on=["root"]}
-        task2 = {cmd="echo task2", depends_on=["root"]}
-        top = {cmd="echo top", depends_on=["task1","task2"]}
-    "#;
-        let manifest = Manifest::from_str(Path::new(""), file_content.to_string()).unwrap();
-        let project = Project::from_manifest(manifest);
-
-        let executable_tasks =
-            ExecutableTask::from_cmd_args(&project, vec!["top".to_string()], None)
-                .get_ordered_dependencies()
-                .await
-                .unwrap();
-
-        let ordered_task_names: Vec<_> = executable_tasks
-            .iter()
-            .map(|task| task.task().as_single_command().unwrap())
-            .collect();
-
-        assert_eq!(
-            ordered_task_names,
-            vec!["echo root", "echo task1", "echo task2", "echo top"]
-        );
-    }
-
-    #[tokio::test]
-    async fn test_platform_ordered_commands() {
-        let file_content = r#"
-        [project]
-        name = "pixi"
-        channels = ["conda-forge"]
-        platforms = ["linux-64"]
-        [tasks]
-        root = "echo root"
-        task1 = {cmd="echo task1", depends_on=["root"]}
-        task2 = {cmd="echo task2", depends_on=["root"]}
-        top = {cmd="echo top", depends_on=["task1","task2"]}
-        [target.linux-64.tasks]
-        root = {cmd="echo linux", depends_on=["task1"]}
-    "#;
-        let manifest = Manifest::from_str(Path::new(""), file_content.to_string()).unwrap();
-        let project = Project::from_manifest(manifest);
-
-        let executable_tasks = ExecutableTask::from_cmd_args(
-            &project,
-            vec!["top".to_string()],
-            Some(Platform::Linux64),
+    async fn test_get_task_env() {
+        let file_contents = r#"
+            [tasks]
+            test = {cmd = "test", cwd = "tests", env = {FOO = "bar"}}
+            "#;
+        let manifest = Manifest::from_str(
+            Path::new("pixi.toml"),
+            format!("{PROJECT_BOILERPLATE}\n{file_contents}").as_str(),
         )
-        .get_ordered_dependencies()
-        .await
         .unwrap();
 
-        let ordered_task_names: Vec<_> = executable_tasks
-            .iter()
-            .map(|task| task.task().as_single_command().unwrap())
-            .collect();
-
-        assert_eq!(
-            ordered_task_names,
-            vec!["echo linux", "echo task1", "echo task2", "echo top",]
-        );
-    }
-
-    #[tokio::test]
-    async fn test_custom_command() {
-        let file_content = r#"
-        [project]
-        name = "pixi"
-        channels = ["conda-forge"]
-        platforms = ["linux-64"]
-    "#;
-        let manifest = Manifest::from_str(Path::new(""), file_content.to_string()).unwrap();
         let project = Project::from_manifest(manifest);
 
-        let executable_tasks = ExecutableTask::from_cmd_args(
-            &project,
-            vec!["echo bla".to_string()],
-            Some(Platform::Linux64),
-        )
-        .get_ordered_dependencies()
-        .await
-        .unwrap();
-
-        assert_eq!(executable_tasks.len(), 1);
-
-        let task = executable_tasks.get(0).unwrap();
-        assert!(task.task().is_custom());
-
-        assert_eq!(task.task().as_single_command().unwrap(), r#""echo bla""#);
+        let environment = project.default_environment();
+        let env = get_task_env(&environment, false).await.unwrap();
+        assert_eq!(
+            env.get("INIT_CWD").unwrap(),
+            &std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
+        );
     }
 }

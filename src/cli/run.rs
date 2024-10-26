@@ -1,79 +1,235 @@
-use std::{collections::HashMap, path::PathBuf, string::String};
+use std::collections::hash_map::Entry;
+use std::collections::HashSet;
+use std::convert::identity;
+use std::{collections::HashMap, string::String};
 
 use clap::Parser;
+use dialoguer::theme::ColorfulTheme;
 use itertools::Itertools;
-use miette::{miette, Context, Diagnostic, IntoDiagnostic};
-use rattler_conda_types::Platform;
+use miette::{Diagnostic, IntoDiagnostic};
 
-use crate::environment::LockFileUsage;
+use crate::cli::cli_config::{PrefixUpdateConfig, ProjectConfig};
+use crate::environment::verify_prefix_location_unchanged;
+use crate::lock_file::UpdateLockFileOptions;
+use crate::project::errors::UnsupportedPlatformError;
+use crate::project::virtual_packages::verify_current_platform_has_required_virtual_packages;
+use crate::project::Environment;
 use crate::task::{
-    ExecutableTask, FailedToParseShellScript, InvalidWorkingDirectory, TraversalError,
+    get_task_env, AmbiguousTask, CanSkip, ExecutableTask, FailedToParseShellScript,
+    InvalidWorkingDirectory, SearchEnvironments, TaskAndEnvironment, TaskGraph,
 };
-use crate::{
-    environment::get_up_to_date_prefix, prefix::Prefix, progress::await_in_progress, Project,
-};
-use rattler_shell::{
-    activation::{ActivationVariables, Activator, PathModificationBehavior},
-    shell::ShellEnum,
-};
+use crate::Project;
+use fancy_display::FancyDisplay;
+use pixi_manifest::TaskName;
 use thiserror::Error;
 use tracing::Level;
 
 /// Runs task in project.
 #[derive(Parser, Debug, Default)]
-#[clap(trailing_var_arg = true, arg_required_else_help = true)]
+#[clap(trailing_var_arg = true)]
 pub struct Args {
-    /// The task you want to run in the projects environment.
+    /// The pixi task or a task shell command you want to run in the project's environment, which can be an executable in the environment's PATH.
     pub task: Vec<String>,
 
-    /// The path to 'pixi.toml'
-    #[arg(long)]
-    pub manifest_path: Option<PathBuf>,
+    #[clap(flatten)]
+    pub project_config: ProjectConfig,
 
     #[clap(flatten)]
-    pub lock_file_usage: super::LockFileUsageArgs,
+    pub prefix_update_config: PrefixUpdateConfig,
+
+    /// The environment to run the task in.
+    #[arg(long, short)]
+    pub environment: Option<String>,
+
+    /// Use a clean environment to run the task
+    ///
+    /// Using this flag will ignore your current shell environment and use bare minimum environment to activate the pixi environment in.
+    #[arg(long)]
+    pub clean_env: bool,
 }
 
 /// CLI entry point for `pixi run`
 /// When running the sigints are ignored and child can react to them. As it pleases.
 pub async fn execute(args: Args) -> miette::Result<()> {
-    let project = Project::load_or_else_discover(args.manifest_path.as_deref())?;
+    // Load the project
+    let project = Project::load_or_else_discover(args.project_config.manifest_path.as_deref())?
+        .with_cli_config(args.prefix_update_config.config.clone());
 
-    // Split 'task' into arguments if it's a single string, supporting commands like:
-    // `"test 1 == 0 || echo failed"` or `"echo foo && echo bar"` or `"echo 'Hello World'"`
-    // This prevents shell interpretation of pixi run inputs.
-    // Use as-is if 'task' already contains multiple elements.
-    let task_args = if args.task.len() == 1 {
-        shlex::split(args.task[0].as_str())
-            .ok_or(miette!("Could not split task, assuming non valid task"))?
+    // Extract the passed in environment name.
+    let environment = project.environment_from_name_or_env_var(args.environment.clone())?;
+
+    // Find the environment to run the task in, if any were specified.
+    let explicit_environment = if args.environment.is_none() && environment.is_default() {
+        None
     } else {
-        args.task
+        Some(environment.clone())
     };
-    tracing::debug!("Task parsed from run command: {:?}", task_args);
 
-    // Get the task to execute
-    let executable_task =
-        ExecutableTask::from_cmd_args(&project, task_args, Some(Platform::current()));
+    // Print all available tasks if no task is provided
+    if args.task.is_empty() {
+        command_not_found(&project, explicit_environment);
+        return Ok(());
+    }
 
-    // Get the environment to run the commands in.
-    let command_env = get_task_env(&project, args.lock_file_usage.into()).await?;
+    // Sanity check of prefix location
+    verify_prefix_location_unchanged(project.default_environment().dir().as_path()).await?;
 
-    // Traverse the task and its dependencies. Execute each task in order.
-    match executable_task
-        .traverse(
-            (),
-            |_, task| execute_task(task, &command_env),
-            |_, _task| async { true },
-        )
-        .await
-    {
-        Ok(_) => Ok(()),
-        Err(TaskExecutionError::NonZeroExitCode(code)) => {
-            // If one of the tasks failed with a non-zero exit code, we exit this parent process
-            // with the same code.
-            std::process::exit(code);
+    let best_platform = environment.best_platform();
+
+    // Verify that the current platform has the required virtual packages for the environment.
+    if let Some(ref explicit_environment) = explicit_environment {
+        verify_current_platform_has_required_virtual_packages(explicit_environment)
+            .into_diagnostic()?;
+    }
+
+    // Ensure that the lock-file is up-to-date.
+    let mut lock_file = project
+        .update_lock_file(UpdateLockFileOptions {
+            lock_file_usage: args.prefix_update_config.lock_file_usage(),
+            ..UpdateLockFileOptions::default()
+        })
+        .await?;
+
+    // Construct a task graph from the input arguments
+    let search_environment = SearchEnvironments::from_opt_env(
+        &project,
+        explicit_environment.clone(),
+        Some(best_platform),
+    )
+    .with_disambiguate_fn(disambiguate_task_interactive);
+
+    let task_graph = TaskGraph::from_cmd_args(&project, &search_environment, args.task)?;
+
+    tracing::info!("Task graph: {}", task_graph);
+
+    // Traverse the task graph in topological order and execute each individual task.
+    let mut task_idx = 0;
+    let mut task_envs = HashMap::new();
+    for task_id in task_graph.topological_order() {
+        let executable_task = ExecutableTask::from_task_graph(&task_graph, task_id);
+
+        // If the task is not executable (e.g. an alias), we skip it. This ensures we don't
+        // instantiate a prefix for an alias.
+        if !executable_task.task().is_executable() {
+            continue;
         }
-        Err(err) => Err(err.into()),
+
+        // Showing which command is being run if the level and type allows it.
+        if tracing::enabled!(Level::WARN) && !executable_task.task().is_custom() {
+            if task_idx > 0 {
+                // Add a newline between task outputs
+                eprintln!();
+            }
+            eprintln!(
+                "{}{}{}{}{}{}{}",
+                console::Emoji("✨ ", ""),
+                console::style("Pixi task (").bold(),
+                console::style(executable_task.name().unwrap_or("unnamed"))
+                    .green()
+                    .bold(),
+                // Only print environment if multiple environments are available
+                if project.environments().len() > 1 {
+                    format!(
+                        " in {}",
+                        executable_task.run_environment.name().fancy_display()
+                    )
+                } else {
+                    "".to_string()
+                },
+                console::style("): ").bold(),
+                executable_task.display_command(),
+                if let Some(description) = executable_task.task().description() {
+                    console::style(format!(": ({})", description)).yellow()
+                } else {
+                    console::style("".to_string()).yellow()
+                }
+            );
+        }
+
+        // check task cache
+        let task_cache = match executable_task
+            .can_skip(&lock_file)
+            .await
+            .into_diagnostic()?
+        {
+            CanSkip::No(cache) => cache,
+            CanSkip::Yes => {
+                eprintln!(
+                    "Task '{}' can be skipped (cache hit) 🚀",
+                    console::style(executable_task.name().unwrap_or("")).bold()
+                );
+                task_idx += 1;
+                continue;
+            }
+        };
+
+        // If we don't have a command environment yet, we need to compute it. We lazily compute the
+        // task environment because we only need the environment if a task is actually executed.
+        let task_env: &_ = match task_envs.entry(executable_task.run_environment.clone()) {
+            Entry::Occupied(env) => env.into_mut(),
+            Entry::Vacant(entry) => {
+                // Ensure there is a valid prefix
+                lock_file.prefix(&executable_task.run_environment).await?;
+
+                let command_env = get_task_env(
+                    &executable_task.run_environment,
+                    args.clean_env || executable_task.task().clean_env(),
+                )
+                .await?;
+                entry.insert(command_env)
+            }
+        };
+
+        // Execute the task itself within the command environment. If one of the tasks failed with
+        // a non-zero exit code, we exit this parent process with the same code.
+        match execute_task(&executable_task, task_env).await {
+            Ok(_) => {
+                task_idx += 1;
+            }
+            Err(TaskExecutionError::NonZeroExitCode(code)) => {
+                if code == 127 {
+                    command_not_found(&project, explicit_environment);
+                }
+                std::process::exit(code);
+            }
+            Err(err) => return Err(err.into()),
+        }
+
+        // Update the task cache with the new hash
+        executable_task
+            .save_cache(&lock_file, task_cache)
+            .await
+            .into_diagnostic()?;
+    }
+
+    Project::warn_on_discovered_from_env(args.project_config.manifest_path.as_deref());
+    Ok(())
+}
+
+/// Called when a command was not found.
+fn command_not_found<'p>(project: &'p Project, explicit_environment: Option<Environment<'p>>) {
+    let available_tasks: HashSet<TaskName> =
+        if let Some(explicit_environment) = explicit_environment {
+            explicit_environment.get_filtered_tasks()
+        } else {
+            project
+                .environments()
+                .into_iter()
+                .filter(|env| verify_current_platform_has_required_virtual_packages(env).is_ok())
+                .flat_map(|env| env.get_filtered_tasks())
+                .collect()
+        };
+
+    if !available_tasks.is_empty() {
+        eprintln!(
+            "\nAvailable tasks:\n{}",
+            available_tasks
+                .into_iter()
+                .sorted()
+                .format_with("\n", |name, f| {
+                    f(&format_args!("\t{}", name.fancy_display().bold()))
+                })
+        );
     }
 }
 
@@ -89,14 +245,14 @@ enum TaskExecutionError {
     InvalidWorkingDirectory(#[from] InvalidWorkingDirectory),
 
     #[error(transparent)]
-    TraverseError(#[from] TraversalError),
+    UnsupportedPlatformError(#[from] UnsupportedPlatformError),
 }
 
 /// Called to execute a single command.
 ///
 /// This function is called from [`execute`].
 async fn execute_task<'p>(
-    task: ExecutableTask<'p>,
+    task: &ExecutableTask<'p>,
     command_env: &HashMap<String, String>,
 ) -> Result<(), TaskExecutionError> {
     let Some(script) = task.as_deno_script()? else {
@@ -111,15 +267,6 @@ async fn execute_task<'p>(
     // some other command we might want to revaluate this.
     let ctrl_c = tokio::spawn(async { while tokio::signal::ctrl_c().await.is_ok() {} });
 
-    // Showing which command is being run if the level and type allows it.
-    if tracing::enabled!(Level::WARN) && !task.task().is_custom() {
-        eprintln!(
-            "{}{}",
-            console::style("✨ Pixi task: ").bold(),
-            task.display_command(),
-        );
-    }
-
     let execute_future =
         deno_task_shell::execute(script, command_env.clone(), &cwd, Default::default());
     let status_code = tokio::select! {
@@ -127,24 +274,6 @@ async fn execute_task<'p>(
         // This should never exit
         _ = ctrl_c => { unreachable!("Ctrl+C should not be triggered") }
     };
-    if status_code == 127 {
-        let available_tasks = task
-            .project()
-            .manifest
-            .tasks(Some(Platform::current()))
-            .into_keys()
-            .sorted()
-            .collect_vec();
-
-        if !available_tasks.is_empty() {
-            eprintln!(
-                "\nAvailable tasks:\n{}",
-                available_tasks.into_iter().format_with("\n", |name, f| {
-                    f(&format_args!("\t{}", console::style(name).bold()))
-                })
-            );
-        }
-    }
 
     if status_code != 0 {
         return Err(TaskExecutionError::NonZeroExitCode(status_code));
@@ -153,86 +282,34 @@ async fn execute_task<'p>(
     Ok(())
 }
 
-/// Determine the environment variables to use when executing a command. This method runs the
-/// activation scripts from the environment and stores the environment variables it added, it adds
-/// environment variables set by the project and merges all of that with the system environment
-/// variables.
-pub async fn get_task_env(
-    project: &Project,
-    lock_file_usage: LockFileUsage,
-) -> miette::Result<HashMap<String, String>> {
-    // Get the prefix which we can then activate.
-    let prefix = get_up_to_date_prefix(project, lock_file_usage, false, None).await?;
+/// Called to disambiguate between environments to run a task in.
+fn disambiguate_task_interactive<'p>(
+    problem: &AmbiguousTask<'p>,
+) -> Option<TaskAndEnvironment<'p>> {
+    let environment_names = problem
+        .environments
+        .iter()
+        .map(|(env, _)| env.name())
+        .collect_vec();
+    let theme = ColorfulTheme {
+        active_item_style: console::Style::new().for_stderr().magenta(),
+        ..ColorfulTheme::default()
+    };
 
-    // Get environment variables from the activation
-    let activation_env = run_activation_async(project, prefix).await?;
-
-    // Get environment variables from the manifest
-    let manifest_env = project.get_metadata_env();
-
-    // Construct command environment by concatenating the environments
-    Ok(std::env::vars()
-        .chain(activation_env.into_iter())
-        .chain(manifest_env.into_iter())
-        .collect())
-}
-
-/// Runs the activation script asynchronously. This function also adds a progress bar.
-pub async fn run_activation_async(
-    project: &Project,
-    prefix: Prefix,
-) -> miette::Result<HashMap<String, String>> {
-    let platform = Platform::current();
-    let additional_activation_scripts = project.activation_scripts(platform)?;
-
-    // Check if the platform and activation script extension match. For Platform::Windows the extension should be .bat and for All other platforms it should be .sh or .bash.
-    for script in additional_activation_scripts.iter() {
-        let extension = script.extension().unwrap_or_default();
-        if platform.is_windows() && extension != "bat" {
-            tracing::warn!("The activation script '{}' does not have the correct extension for the platform '{}'. The extension should be '.bat'.", script.display(), platform);
-        } else if !platform.is_windows() && extension != "sh" && extension != "bash" {
-            tracing::warn!("The activation script '{}' does not have the correct extension for the platform '{}'. The extension should be '.sh' or '.bash'.", script.display(), platform);
-        }
-    }
-
-    await_in_progress(
-        "activating environment",
-        run_activation(prefix, additional_activation_scripts.into_iter().collect()),
-    )
-    .await
-    .wrap_err("failed to activate environment")
-}
-
-/// Runs and caches the activation script.
-async fn run_activation(
-    prefix: Prefix,
-    additional_activation_scripts: Vec<PathBuf>,
-) -> miette::Result<HashMap<String, String>> {
-    let activator_result = tokio::task::spawn_blocking(move || {
-        // Run and cache the activation script
-        let shell: ShellEnum = ShellEnum::default();
-
-        // Construct an activator for the script
-        let mut activator = Activator::from_path(prefix.root(), shell, Platform::current())?;
-        activator
-            .activation_scripts
-            .extend(additional_activation_scripts);
-
-        // Run the activation
-        activator.run_activation(ActivationVariables {
-            // Get the current PATH variable
-            path: Default::default(),
-
-            // Start from an empty prefix
-            conda_prefix: None,
-
-            // Prepending environment paths so they get found first.
-            path_modification_behavior: PathModificationBehavior::Prepend,
-        })
-    })
-    .await
-    .into_diagnostic()?
-    .into_diagnostic()?;
-
-    Ok(activator_result)
+    dialoguer::Select::with_theme(&theme)
+        .with_prompt(format!(
+            "The task '{}' {}can be run in multiple environments.\n\nPlease select an environment to run the task in:",
+            problem.task_name.fancy_display(),
+            if let Some(dependency) = &problem.depended_on_by {
+                format!("(depended on by '{}') ", dependency.0.fancy_display())
+            } else {
+                String::new()
+            }
+        ))
+        .report(false)
+        .items(&environment_names)
+        .default(0)
+        .interact_opt()
+        .map_or(None, identity)
+        .map(|idx| problem.environments[idx].clone())
 }

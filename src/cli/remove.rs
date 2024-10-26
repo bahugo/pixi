@@ -1,114 +1,93 @@
-use std::path::PathBuf;
-use std::str::FromStr;
-
 use clap::Parser;
-use miette::miette;
-use rattler_conda_types::Platform;
+use miette::Context;
 
-use crate::environment::LockFileUsage;
-use crate::{consts, environment::get_up_to_date_prefix, project::SpecType, Project};
+use crate::environment::update_prefix;
+use crate::DependencyType;
+use crate::Project;
 
-/// Remove the dependency from the project
+use crate::cli::cli_config::{DependencyConfig, PrefixUpdateConfig, ProjectConfig};
+
+use super::has_specs::HasSpecs;
+
+/// Removes dependencies from the project
+///
+///  If the project manifest is a `pyproject.toml`, removing a pypi dependency with the `--pypi` flag will remove it from either
+/// - the native pyproject `project.dependencies` array or, if a feature is specified, the native `project.optional-dependencies` table
+/// - pixi `pypi-dependencies` tables of the default feature or, if a feature is specified, a named feature
+///
 #[derive(Debug, Default, Parser)]
+#[clap(arg_required_else_help = true)]
 pub struct Args {
-    /// List of dependencies you wish to remove from the project
-    #[arg(required = true)]
-    pub deps: Vec<String>,
+    #[clap(flatten)]
+    pub project_config: ProjectConfig,
 
-    /// The path to 'pixi.toml'
-    #[arg(long)]
-    pub manifest_path: Option<PathBuf>,
+    #[clap(flatten)]
+    pub dependency_config: DependencyConfig,
 
-    /// Whether dependency is a host dependency
-    #[arg(long, conflicts_with = "build")]
-    pub host: bool,
-
-    /// Whether dependency is a build dependency
-    #[arg(long, conflicts_with = "host")]
-    pub build: bool,
-
-    /// Whether the dependency is a pypi package
-    #[arg(long)]
-    pub pypi: bool,
-
-    /// The platform for which the dependency should be removed
-    #[arg(long, short)]
-    pub platform: Option<Platform>,
-}
-
-fn convert_pkg_name<T>(deps: &[String]) -> miette::Result<Vec<T>>
-where
-    T: FromStr,
-{
-    deps.iter()
-        .map(|dep| {
-            T::from_str(dep)
-                .map_err(|_| miette!("Can't convert dependency name `{dep}` to package name"))
-        })
-        .collect()
+    #[clap(flatten)]
+    pub prefix_update_config: PrefixUpdateConfig,
 }
 
 pub async fn execute(args: Args) -> miette::Result<()> {
-    let mut project = Project::load_or_else_discover(args.manifest_path.as_deref())?;
-    let deps = args.deps;
-    let spec_type = if args.host {
-        SpecType::Host
-    } else if args.build {
-        SpecType::Build
-    } else {
-        SpecType::Run
-    };
+    let (dependency_config, prefix_update_config, project_config) = (
+        args.dependency_config,
+        args.prefix_update_config,
+        args.project_config,
+    );
 
-    let section_name: String = if args.pypi {
-        consts::PYPI_DEPENDENCIES.to_string()
-    } else {
-        spec_type.name().to_string()
-    };
-    let table_name = if let Some(p) = &args.platform {
-        format!("target.{}.{}", p.as_str(), section_name)
-    } else {
-        section_name
-    };
+    let mut project = Project::load_or_else_discover(project_config.manifest_path.as_deref())?
+        .with_cli_config(prefix_update_config.config.clone());
+    let dependency_type = dependency_config.dependency_type();
 
-    fn format_ok_message(pkg_name: &str, pkg_extras: &str, table_name: &str) -> String {
-        format!(
-            "Removed {} from [{}]",
-            console::style(format!("{pkg_name} {pkg_extras}")).bold(),
-            console::style(table_name).bold()
-        )
-    }
-    let mut sucessful_output: Vec<String> = Vec::with_capacity(deps.len());
-    if args.pypi {
-        let all_pkg_name = convert_pkg_name::<rip::types::PackageName>(&deps)?;
-        for dep in all_pkg_name.iter() {
-            let (name, req) = project
-                .manifest
-                .remove_pypi_dependency(dep, args.platform)?;
-            sucessful_output.push(format_ok_message(
-                name.as_str(),
-                &req.to_string(),
-                &table_name,
-            ));
+    match dependency_type {
+        DependencyType::PypiDependency => {
+            for name in dependency_config.pypi_deps(&project)?.keys() {
+                project
+                    .manifest
+                    .remove_pypi_dependency(
+                        name,
+                        &dependency_config.platform,
+                        &dependency_config.feature_name(),
+                    )
+                    .wrap_err(format!(
+                        "failed to remove PyPI dependency: '{}'",
+                        name.as_source()
+                    ))?;
+            }
         }
-    } else {
-        let all_pkg_name = convert_pkg_name::<rattler_conda_types::PackageName>(&deps)?;
-        for dep in all_pkg_name.iter() {
-            let (name, req) = project
-                .manifest
-                .remove_dependency(dep, spec_type, args.platform)?;
-            sucessful_output.push(format_ok_message(
-                name.as_source(),
-                &req.to_string(),
-                &table_name,
-            ));
+        DependencyType::CondaDependency(spec_type) => {
+            for name in dependency_config.specs()?.keys() {
+                project
+                    .manifest
+                    .remove_dependency(
+                        name,
+                        spec_type,
+                        &dependency_config.platform,
+                        &dependency_config.feature_name(),
+                    )
+                    .wrap_err(format!(
+                        "failed to remove dependency: '{}'",
+                        name.as_source()
+                    ))?;
+            }
         }
     };
 
     project.save()?;
-    eprintln!("{}", sucessful_output.join("\n"));
 
+    // TODO: update all environments touched by this feature defined.
     // updating prefix after removing from toml
-    let _ = get_up_to_date_prefix(&project, LockFileUsage::Update, false, None).await?;
+    if !prefix_update_config.no_lockfile_update {
+        update_prefix(
+            &project.default_environment(),
+            prefix_update_config.lock_file_usage(),
+            prefix_update_config.no_install,
+        )
+        .await?;
+    }
 
+    dependency_config.display_success("Removed", Default::default());
+
+    Project::warn_on_discovered_from_env(project_config.manifest_path.as_deref());
     Ok(())
 }

@@ -55,7 +55,7 @@ Use the `shell` command to activate the environment and start a new shell in the
 ```shell
 pixi shell
 python
-exit
+exit()
 ```
 
 You've just learned the basic features of pixi:
@@ -85,6 +85,18 @@ pixi global install fish
 # Install other prefix.dev tools
 pixi global install rattler-build
 
-# Install a linter you want to use in multiple projects.
-pixi global install ruff
+# Install a multi package environment
+pixi global install --environment data-science-env --expose python --expose jupyter python jupyter numpy pandas
 ```
+
+## Use pixi in GitHub Actions
+
+You can use pixi in GitHub Actions to install dependencies and run commands.
+It supports automatic caching of your environments.
+
+```yml
+- uses: prefix-dev/setup-pixi@v0.5.1
+- run: pixi run cowpy "Thanks for using pixi"
+```
+
+See the [GitHub Actions](./advanced/github_actions.md) for more details.
