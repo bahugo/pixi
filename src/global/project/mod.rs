@@ -4,6 +4,7 @@ use super::{extract_executable_from_script, BinDir, EnvRoot, StateChange, StateC
 use crate::global::common::{
     channel_url_to_prioritized_channel, find_package_records, get_expose_scripts_sync_status,
 };
+use crate::global::find_executables_for_many_records;
 use crate::global::install::{
     create_activation_script, create_executable_scripts, script_exec_mapping,
 };
@@ -839,7 +840,7 @@ impl Project {
 
         let prefix_records = &prefix.find_installed_packages(None).await?;
 
-        let all_executables = &prefix.find_executables(prefix_records.as_slice());
+        let all_executables = find_executables_for_many_records(&prefix, prefix_records);
 
         let exposed: HashSet<&str> = environment
             .exposed
